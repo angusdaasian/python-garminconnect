@@ -10,8 +10,21 @@ import uvicorn
 import os
 from datetime import datetime, timedelta
 from pathlib import Path
-import polyline  # pip install polyline
+import polyline
 import xml.etree.ElementTree as ET
+
+TOKEN_PATH = os.environ.get("GARMIN_TOKEN_PATH", "/tmp/garmin_tokens")
+
+app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 
 def parse_gpx_to_polyline(gpx_bytes: bytes) -> str | None:
     """Parse GPX XML and encode track points as a polyline string."""
@@ -25,7 +38,6 @@ def parse_gpx_to_polyline(gpx_bytes: bytes) -> str | None:
             coords.append((lat, lon))
         if len(coords) < 2:
             return None
-        # Downsample to ~200 points to keep polyline small
         if len(coords) > 200:
             step = len(coords) // 200
             coords = coords[::step]
@@ -33,6 +45,66 @@ def parse_gpx_to_polyline(gpx_bytes: bytes) -> str | None:
     except Exception as e:
         print(f"GPX parse error: {e}")
         return None
+
+
+@app.get("/garmin-activities")
+def get_activities(
+    email: str = Query(...),
+    password: str = Query(...),
+    days: int = Query(30),
+    detail_limit: int = Query(0),
+):
+    """Fetch Garmin activity list for the past N days."""
+    try:
+        Path(TOKEN_PATH).mkdir(parents=True, exist_ok=True)
+        client = Garmin(email=email, password=password)
+        client.login(TOKEN_PATH)
+
+        end_date = datetime.now()
+        start_date = end_date - timedelta(days=days)
+
+        activities = client.get_activities_by_date(
+            start_date.strftime("%Y-%m-%d"),
+            end_date.strftime("%Y-%m-%d"),
+        )
+
+        results = []
+        for a in activities:
+            sport = a.get("activityType", {}).get("typeKey", "unknown")
+            duration = a.get("duration", 0) or 0
+            distance = a.get("distance", 0) or 0
+            avg_speed = (distance / duration) if duration > 0 else 0
+            avg_pace = (duration / 60 / (distance / 1000)) if distance > 0 else None
+
+            results.append({
+                "garmin_activity_id": str(a.get("activityId", "")),
+                "activity_name": a.get("activityName", "Garmin Activity"),
+                "activity_type": sport,
+                "start_time": a.get("startTimeLocal", a.get("startTimeGMT")),
+                "duration_seconds": round(duration),
+                "distance_meters": round(distance, 2),
+                "calories": a.get("calories"),
+                "average_hr": a.get("averageHR"),
+                "max_hr": a.get("maxHR"),
+                "elevation_gain": a.get("elevationGain"),
+                "average_speed": round(avg_speed, 4),
+                "average_pace": round(avg_pace, 2) if avg_pace else None,
+                "avg_cadence": a.get("averageRunningCadenceInStepsPerMinute"),
+                "aerobic_te": a.get("aerobicTrainingEffect"),
+                "anaerobic_te": a.get("anaerobicTrainingEffect"),
+                "vo2max": a.get("vO2MaxValue"),
+                "training_load": a.get("activityTrainingLoad"),
+                "has_gps": a.get("hasPolyline", False),
+            })
+
+        return results
+
+    except GarminConnectTooManyRequestsError:
+        raise HTTPException(status_code=429, detail="Garmin Rate Limit")
+    except (GarminConnectAuthenticationError, GarminConnectConnectionError) as e:
+        raise HTTPException(status_code=401, detail=f"Garmin login failed: {e}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/garmin-activity-details")
@@ -104,3 +176,8 @@ def get_activity_details(
         raise HTTPException(status_code=429, detail="Garmin Rate Limit")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
