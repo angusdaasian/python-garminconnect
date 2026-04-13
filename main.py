@@ -1,3 +1,15 @@
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
+from garminconnect import (
+    Garmin,
+    GarminConnectAuthenticationError,
+    GarminConnectConnectionError,
+    GarminConnectTooManyRequestsError,
+)
+import uvicorn
+import os
+from datetime import datetime, timedelta
+from pathlib import Path
 import polyline  # pip install polyline
 import xml.etree.ElementTree as ET
 
