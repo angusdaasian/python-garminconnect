@@ -43,7 +43,7 @@ def get_activities(
         mapped_data = []
         limit_date = datetime.now() - timedelta(days=days)
 
-        # Limit split fetching to prevent Garmin rate limits (last 5 runs)
+        # Limit detail fetching to prevent Garmin rate limits (last 5 runs)
         detail_limit = 5 
         detail_count = 0
 
@@ -75,12 +75,14 @@ def get_activities(
                 "average_pace": round(act.get("averagePace", 0), 2),
                 "total_elevation_gain": int(act.get("elevationGain", 0)) if act.get("elevationGain") else 0,
                 "source": "Garmin",
-                "laps": [] 
+                "laps": [],
+                "map_polyline": None 
             }
 
-            # Fetch detailed splits for recent activities
+            # Fetch detailed splits and map data for recent activities
             if detail_count < detail_limit:
                 try:
+                    # 1. Fetch Laps/Splits
                     splits_data = client.get_activity_splits(activity_id)
                     laps = splits_data.get("lapDTOs", [])
                     
@@ -93,10 +95,16 @@ def get_activities(
                             "avg_speed": lap.get("averageSpeed"),
                             "elevation_gain": int(lap.get("elevationGain", 0)) if lap.get("elevationGain") else 0
                         })
+
+                    # 2. Fetch Map Polyline
+                    # get_activity_details returns the encoded summary polyline
+                    details = client.get_activity_details(activity_id)
+                    summary_dto = details.get("summaryDTO", {})
+                    activity_item["map_polyline"] = summary_dto.get("polyline")
+
                     detail_count += 1
-                except Exception as split_err:
-                    # Log error but don't fail the whole request
-                    print(f"Skipping splits for {activity_id}: {split_err}")
+                except Exception as detail_err:
+                    print(f"Skipping details for {activity_id}: {detail_err}")
 
             mapped_data.append(activity_item)
             
@@ -108,6 +116,5 @@ def get_activities(
         raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
-    # Railway provides the PORT environment variable
     port = int(os.environ.get("PORT", 8080))
     uvicorn.run(app, host="0.0.0.0", port=port)
