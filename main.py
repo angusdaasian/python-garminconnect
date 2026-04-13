@@ -13,6 +13,7 @@ from pathlib import Path
 
 app = FastAPI()
 
+# Enable CORS for Lovable/Frontend integration
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -21,6 +22,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Railway persistent storage for session tokens
 TOKEN_PATH = "/tmp/garmin_tokens"
 
 @app.get("/garmin-activities")
@@ -35,11 +37,13 @@ def get_activities(
         client = Garmin(email=email, password=password)
         client.login(TOKEN_PATH)
         
+        # Fetch activity list
         activities = client.get_activities(0, 50)
         
         mapped_data = []
         limit_date = datetime.now() - timedelta(days=days)
 
+        # Limit split fetching to prevent Garmin rate limits (last 5 runs)
         detail_limit = 5 
         detail_count = 0
 
@@ -53,6 +57,7 @@ def get_activities(
             activity_id = act.get("activityId")
             raw_type = act.get("activityType", {}).get("typeKey", "").lower()
             
+            # Basic sport type categorization
             sport_type = "Run"
             if "walk" in raw_type: sport_type = "Walk"
             elif "cycle" in raw_type or "ride" in raw_type: sport_type = "Ride"
@@ -68,12 +73,12 @@ def get_activities(
                 "start_date": start_time_dt.isoformat(),
                 "average_heartrate": int(act.get("averageHR", 0)) if act.get("averageHR") else None,
                 "average_pace": round(act.get("averagePace", 0), 2),
-                # TOTAL ELEVATION GAIN
                 "total_elevation_gain": int(act.get("elevationGain", 0)) if act.get("elevationGain") else 0,
                 "source": "Garmin",
                 "laps": [] 
             }
 
+            # Fetch detailed splits for recent activities
             if detail_count < detail_limit:
                 try:
                     splits_data = client.get_activity_splits(activity_id)
@@ -81,4 +86,28 @@ def get_activities(
                     
                     for lap in laps:
                         activity_item["laps"].append({
-                            "split
+                            "split_number": lap.get("lapIndex"),
+                            "distance": lap.get("distance"),
+                            "elapsed_time": lap.get("elapsedDuration"),
+                            "avg_hr": lap.get("averageHeartRate"),
+                            "avg_speed": lap.get("averageSpeed"),
+                            "elevation_gain": int(lap.get("elevationGain", 0)) if lap.get("elevationGain") else 0
+                        })
+                    detail_count += 1
+                except Exception as split_err:
+                    # Log error but don't fail the whole request
+                    print(f"Skipping splits for {activity_id}: {split_err}")
+
+            mapped_data.append(activity_item)
+            
+        return mapped_data
+
+    except GarminConnectTooManyRequestsError:
+        raise HTTPException(status_code=429, detail="Garmin Rate Limit: Please wait 1-2 hours.")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+if __name__ == "__main__":
+    # Railway provides the PORT environment variable
+    port = int(os.environ.get("PORT", 8080))
+    uvicorn.run(app, host="0.0.0.0", port=port)
