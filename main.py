@@ -23,10 +23,6 @@ app.add_middleware(
 
 TOKEN_PATH = "/tmp/garmin_tokens"
 
-@app.get("/")
-def home():
-    return {"status": "online", "message": "Garmin Bridge - Detailed Splits Version"}
-
 @app.get("/garmin-activities")
 def get_activities(
     email: str = Query(...), 
@@ -39,13 +35,11 @@ def get_activities(
         client = Garmin(email=email, password=password)
         client.login(TOKEN_PATH)
         
-        # Fetch summary of last 50 activities
         activities = client.get_activities(0, 50)
         
         mapped_data = []
         limit_date = datetime.now() - timedelta(days=days)
 
-        # To avoid 429 errors, we only fetch splits for the most recent runs
         detail_limit = 5 
         detail_count = 0
 
@@ -59,7 +53,6 @@ def get_activities(
             activity_id = act.get("activityId")
             raw_type = act.get("activityType", {}).get("typeKey", "").lower()
             
-            # Basic mapping
             sport_type = "Run"
             if "walk" in raw_type: sport_type = "Walk"
             elif "cycle" in raw_type or "ride" in raw_type: sport_type = "Ride"
@@ -74,42 +67,18 @@ def get_activities(
                 "moving_time": int(act.get("duration", 0)),
                 "start_date": start_time_dt.isoformat(),
                 "average_heartrate": int(act.get("averageHR", 0)) if act.get("averageHR") else None,
-                "average_pace": round(act.get("averagePace", 0), 2), # sec per meter
+                "average_pace": round(act.get("averagePace", 0), 2),
+                # TOTAL ELEVATION GAIN
+                "total_elevation_gain": int(act.get("elevationGain", 0)) if act.get("elevationGain") else 0,
                 "source": "Garmin",
-                "laps": [] # Default empty
+                "laps": [] 
             }
 
-            # FETCH DETAILED SPLITS (Laps)
-            # Only fetch for the most recent activities to prevent rate limiting
             if detail_count < detail_limit:
                 try:
                     splits_data = client.get_activity_splits(activity_id)
-                    # lapDTOs contains the "per kilometer/mile" data
                     laps = splits_data.get("lapDTOs", [])
                     
                     for lap in laps:
                         activity_item["laps"].append({
-                            "split_number": lap.get("lapIndex"),
-                            "distance": lap.get("distance"),
-                            "elapsed_time": lap.get("elapsedDuration"),
-                            "avg_hr": lap.get("averageHeartRate"),
-                            "avg_speed": lap.get("averageSpeed") # meters/sec
-                        })
-                    detail_count += 1
-                except Exception as split_err:
-                    print(f"Skipping splits for {activity_id}: {split_err}")
-
-            mapped_data.append(activity_item)
-            
-        return mapped_data
-
-    except GarminConnectTooManyRequestsError:
-        raise HTTPException(status_code=429, detail="Garmin Rate Limit: Please wait 1-2 hours.")
-    except GarminConnectAuthenticationError:
-        raise HTTPException(status_code=401, detail="Invalid Garmin Credentials.")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8080))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+                            "split
