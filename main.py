@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from garminconnect import (
     Garmin,
@@ -27,7 +27,6 @@ app.add_middleware(
 
 
 def parse_gpx_to_polyline(gpx_bytes: bytes) -> str | None:
-    """Parse GPX XML and encode track points as a polyline string."""
     try:
         root = ET.fromstring(gpx_bytes)
         ns = {"gpx": "http://www.topografix.com/GPX/1/1"}
@@ -47,14 +46,17 @@ def parse_gpx_to_polyline(gpx_bytes: bytes) -> str | None:
         return None
 
 
-@app.get("/garmin-activities")
-def get_activities(
-    email: str = Query(...),
-    password: str = Query(...),
-    days: int = Query(30),
-    detail_limit: int = Query(0),
-):
-    """Fetch Garmin activity list for the past N days."""
+@app.post("/garmin-activities")
+async def post_activities(request: Request):
+    body = await request.json()
+    email = body.get("email")
+    password = body.get("password")
+    days = body.get("days", 30)
+    detail_limit = body.get("detail_limit", 0)
+
+    if not email or not password:
+        raise HTTPException(status_code=400, detail="email and password required")
+
     try:
         Path(TOKEN_PATH).mkdir(parents=True, exist_ok=True)
         client = Garmin(email=email, password=password)
@@ -107,13 +109,16 @@ def get_activities(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/garmin-activity-details")
-def get_activity_details(
-    email: str = Query(...),
-    password: str = Query(...),
-    activity_ids: str = Query(...),
-):
-    """Fetch splits + weather + map polyline for specific activity IDs."""
+@app.post("/garmin-activity-details")
+async def post_activity_details(request: Request):
+    body = await request.json()
+    email = body.get("email")
+    password = body.get("password")
+    activity_ids = body.get("activity_ids", "")
+
+    if not email or not password:
+        raise HTTPException(status_code=400, detail="email and password required")
+
     try:
         Path(TOKEN_PATH).mkdir(parents=True, exist_ok=True)
         client = Garmin(email=email, password=password)
@@ -126,7 +131,6 @@ def get_activity_details(
             try:
                 item = {"laps": [], "weather": None, "map_polyline": None}
 
-                # 1. Splits
                 splits_data = client.get_activity_splits(activity_id)
                 for lap in splits_data.get("lapDTOs", []):
                     item["laps"].append({
@@ -138,7 +142,6 @@ def get_activity_details(
                         "elevation_gain": int(lap.get("elevationGain", 0)) if lap.get("elevationGain") else 0,
                     })
 
-                # 2. Weather
                 try:
                     weather = client.get_activity_weather(activity_id)
                     if weather:
@@ -154,7 +157,6 @@ def get_activity_details(
                 except Exception:
                     pass
 
-                # 3. Download GPX and extract polyline
                 try:
                     gpx_data = client.download_activity(
                         activity_id,
