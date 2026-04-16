@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from garminconnect import (
     Garmin,
@@ -8,12 +8,13 @@ from garminconnect import (
 )
 import uvicorn
 import os
+import hashlib
 from datetime import datetime, timedelta
 from pathlib import Path
 import polyline
 import xml.etree.ElementTree as ET
 
-TOKEN_PATH = os.environ.get("GARMIN_TOKEN_PATH", "/tmp/garmin_tokens")
+BASE_TOKEN_PATH = os.environ.get("GARMIN_TOKEN_PATH", "/tmp/garmin_tokens")
 
 app = FastAPI()
 
@@ -24,6 +25,13 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+def get_user_token_path(email: str) -> str:
+    user_hash = hashlib.sha256(email.lower().strip().encode()).hexdigest()
+    path = os.path.join(BASE_TOKEN_PATH, user_hash)
+    Path(path).mkdir(parents=True, exist_ok=True)
+    return path
 
 
 def parse_gpx_to_polyline(gpx_bytes: bytes) -> str | None:
@@ -58,9 +66,9 @@ async def post_activities(request: Request):
         raise HTTPException(status_code=400, detail="email and password required")
 
     try:
-        Path(TOKEN_PATH).mkdir(parents=True, exist_ok=True)
+        token_path = get_user_token_path(email)
         client = Garmin(email=email, password=password)
-        client.login(TOKEN_PATH)
+        client.login(token_path)
 
         end_date = datetime.now()
         start_date = end_date - timedelta(days=days)
@@ -120,9 +128,9 @@ async def post_activity_details(request: Request):
         raise HTTPException(status_code=400, detail="email and password required")
 
     try:
-        Path(TOKEN_PATH).mkdir(parents=True, exist_ok=True)
+        token_path = get_user_token_path(email)
         client = Garmin(email=email, password=password)
-        client.login(TOKEN_PATH)
+        client.login(token_path)
 
         ids = [aid.strip() for aid in activity_ids.split(",") if aid.strip()]
         result = {}
