@@ -3,3 +3,4 @@ uvicorn
 garminconnect
 pydantic
 polyline
+PyJWT
