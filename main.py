@@ -9,8 +9,8 @@ from garminconnect import (
 import uvicorn
 import os
 import hashlib
-import secrets
-from datetime import datetime, timedelta
+import jwt
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 import polyline
@@ -18,6 +18,9 @@ import xml.etree.ElementTree as ET
 
 BASE_TOKEN_PATH = os.environ.get("GARMIN_TOKEN_PATH", "/tmp/garmin_tokens")
 SESSION_TTL_DAYS = 365
+SESSION_SECRET = os.environ.get("SESSION_SECRET")
+if not SESSION_SECRET:
+    raise RuntimeError("SESSION_SECRET env var is required")
 
 app = FastAPI()
 
@@ -29,10 +32,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# In-memory session store: {token: {"email","password","expires_at"}}
-# NOTE: resets on every Railway redeploy/restart — users will need to reconnect.
-SESSIONS: dict = {}
-
 
 def get_user_token_path(email: str) -> str:
     user_hash = hashlib.sha256(email.lower().strip().encode()).hexdigest()
@@ -41,25 +40,57 @@ def get_user_token_path(email: str) -> str:
     return path
 
 
-def cleanup_expired_sessions():
-    now = datetime.utcnow()
-    expired = [t for t, s in SESSIONS.items() if s["expires_at"] < now]
-    for t in expired:
-        SESSIONS.pop(t, None)
+def issue_session_token(email: str) -> tuple[str, datetime]:
+    """Create a signed JWT containing the user's email. Stateless — no server storage."""
+    expires_at = datetime.now(timezone.utc) + timedelta(days=SESSION_TTL_DAYS)
+    payload = {
+        "email": email,
+        "exp": int(expires_at.timestamp()),
+        "iat": int(datetime.now(timezone.utc).timestamp()),
+    }
+    token = jwt.encode(payload, SESSION_SECRET, algorithm="HS256")
+    return token, expires_at
 
 
-def get_session(authorization: Optional[str]) -> dict:
-    cleanup_expired_sessions()
+def get_email_from_session(authorization: Optional[str]) -> str:
+    """Decode bearer JWT → return email. Raises 401 on any failure."""
     if not authorization or not authorization.lower().startswith("bearer "):
         raise HTTPException(status_code=401, detail="Missing bearer token")
     token = authorization.split(" ", 1)[1].strip()
-    session = SESSIONS.get(token)
-    if not session:
-        raise HTTPException(status_code=401, detail="Invalid or expired session")
-    if session["expires_at"] < datetime.utcnow():
-        SESSIONS.pop(token, None)
+    try:
+        payload = jwt.decode(token, SESSION_SECRET, algorithms=["HS256"])
+    except jwt.ExpiredSignatureError:
         raise HTTPException(status_code=401, detail="Session expired")
-    return session
+    except jwt.InvalidTokenError as e:
+        raise HTTPException(status_code=401, detail=f"Invalid session: {e}")
+    email = payload.get("email")
+    if not email:
+        raise HTTPException(status_code=401, detail="Invalid session payload")
+    return email
+
+
+def login_with_cached_tokens(email: str) -> Garmin:
+    """Re-login using cached Garmin tokens on disk (no password needed if tokens valid).
+    Raises 401 if cached tokens are missing or invalid — user must reconnect."""
+    token_path = get_user_token_path(email)
+    # Check the directory has token files
+    has_tokens = any(Path(token_path).iterdir()) if Path(token_path).exists() else False
+    if not has_tokens:
+        raise HTTPException(
+            status_code=401,
+            detail="Garmin tokens not found on server. Please reconnect."
+        )
+    try:
+        client = Garmin()
+        client.login(token_path)
+        return client
+    except (GarminConnectAuthenticationError, GarminConnectConnectionError) as e:
+        raise HTTPException(
+            status_code=401,
+            detail=f"Garmin tokens invalid or expired. Please reconnect. ({e})"
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Garmin login error: {e}")
 
 
 def parse_gpx_to_polyline(gpx_bytes: bytes) -> str | None:
@@ -83,10 +114,8 @@ def parse_gpx_to_polyline(gpx_bytes: bytes) -> str | None:
 
 
 def parse_tcx_laps(tcx_bytes: bytes) -> list:
-    """Parse TCX file and extract per-lap data including HR. Most reliable HR source."""
     try:
         root = ET.fromstring(tcx_bytes)
-        # TCX uses a namespace
         ns = {"tcx": "http://www.garmin.com/xmlschemas/TrainingCenterDatabase/v2"}
         laps = []
         for idx, lap_el in enumerate(root.findall(".//tcx:Lap", ns), start=1):
@@ -135,7 +164,6 @@ def parse_tcx_laps(tcx_bytes: bytes) -> list:
 
 
 def map_lap_dto(lap: dict, idx: int) -> dict:
-    """Map a Garmin lapDTO into our normalized lap shape."""
     distance_m = lap.get("distance") or 0
     elapsed_s = lap.get("elapsedDuration") or lap.get("duration") or 0
     avg_speed = lap.get("averageSpeed")
@@ -170,6 +198,7 @@ async def garmin_login(request: Request):
     try:
         token_path = get_user_token_path(email)
         client = Garmin(email=email, password=password)
+        # Login with password — this writes Garmin tokens to disk for future stateless reuse
         client.login(token_path)
         try:
             display_name = client.get_full_name() or email
@@ -182,14 +211,12 @@ async def garmin_login(request: Request):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-    token = secrets.token_urlsafe(32)
-    expires_at = datetime.utcnow() + timedelta(days=SESSION_TTL_DAYS)
-    SESSIONS[token] = {"email": email, "password": password, "expires_at": expires_at}
-    cleanup_expired_sessions()
+    # Issue stateless JWT — no in-memory storage
+    token, expires_at = issue_session_token(email)
 
     return {
         "session_token": token,
-        "expires_at": expires_at.isoformat() + "Z",
+        "expires_at": expires_at.isoformat().replace("+00:00", "Z"),
         "display_name": display_name,
     }
 
@@ -197,26 +224,30 @@ async def garmin_login(request: Request):
 # ── /garmin-logout ──
 @app.post("/garmin-logout")
 async def garmin_logout(authorization: Optional[str] = Header(None)):
-    if authorization and authorization.lower().startswith("bearer "):
-        token = authorization.split(" ", 1)[1].strip()
-        SESSIONS.pop(token, None)
+    # Stateless JWT — nothing to revoke server-side. Optionally wipe cached Garmin tokens.
+    try:
+        email = get_email_from_session(authorization)
+        token_path = Path(get_user_token_path(email))
+        if token_path.exists():
+            for f in token_path.iterdir():
+                try:
+                    f.unlink()
+                except Exception:
+                    pass
+    except HTTPException:
+        pass  # Invalid/expired token — nothing to clean
     return {"success": True}
 
 
 # ── /garmin-activities ──
 @app.post("/garmin-activities")
 async def post_activities(request: Request, authorization: Optional[str] = Header(None)):
-    session = get_session(authorization)
-    email = session["email"]
-    password = session["password"]
-
+    email = get_email_from_session(authorization)
     body = await request.json()
     days = body.get("days", 30)
 
     try:
-        token_path = get_user_token_path(email)
-        client = Garmin(email=email, password=password)
-        client.login(token_path)
+        client = login_with_cached_tokens(email)
 
         end_date = datetime.now()
         start_date = end_date - timedelta(days=days)
@@ -257,10 +288,10 @@ async def post_activities(request: Request, authorization: Optional[str] = Heade
 
         return results
 
+    except HTTPException:
+        raise
     except GarminConnectTooManyRequestsError:
         raise HTTPException(status_code=429, detail="Garmin Rate Limit")
-    except (GarminConnectAuthenticationError, GarminConnectConnectionError) as e:
-        raise HTTPException(status_code=401, detail=f"Garmin login failed: {e}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -268,17 +299,12 @@ async def post_activities(request: Request, authorization: Optional[str] = Heade
 # ── /garmin-activity-details ──
 @app.post("/garmin-activity-details")
 async def post_activity_details(request: Request, authorization: Optional[str] = Header(None)):
-    session = get_session(authorization)
-    email = session["email"]
-    password = session["password"]
-
+    email = get_email_from_session(authorization)
     body = await request.json()
     activity_ids = body.get("activity_ids", "")
 
     try:
-        token_path = get_user_token_path(email)
-        client = Garmin(email=email, password=password)
-        client.login(token_path)
+        client = login_with_cached_tokens(email)
 
         ids = [aid.strip() for aid in activity_ids.split(",") if aid.strip()]
         result = {}
@@ -290,7 +316,6 @@ async def post_activity_details(request: Request, authorization: Optional[str] =
                 # ── 3-tier lap fetch: laps → splits → TCX ──
                 mapped_laps = []
 
-                # Tier 1: get_activity_laps (manual lap-button presses)
                 try:
                     laps_data = client.get_activity_laps(activity_id)
                     raw_laps = laps_data.get("lapDTOs", []) or []
@@ -299,7 +324,6 @@ async def post_activity_details(request: Request, authorization: Optional[str] =
                 except Exception as e:
                     print(f"get_activity_laps failed for {activity_id}: {e}")
 
-                # Tier 2: get_activity_splits (auto 1km/mile splits)
                 if not mapped_laps:
                     try:
                         splits_data = client.get_activity_splits(activity_id)
@@ -309,8 +333,6 @@ async def post_activity_details(request: Request, authorization: Optional[str] =
                     except Exception as e:
                         print(f"get_activity_splits failed for {activity_id}: {e}")
 
-                # Tier 3: TCX fallback (most reliable for HR)
-                # Trigger if we have NO laps OR laps are missing HR data
                 needs_tcx_fallback = not mapped_laps or all(
                     not lap.get("avg_hr") for lap in mapped_laps
                 )
@@ -323,7 +345,6 @@ async def post_activity_details(request: Request, authorization: Optional[str] =
                         if tcx_data:
                             tcx_laps = parse_tcx_laps(tcx_data)
                             if tcx_laps:
-                                # If we already have laps but missing HR, merge HR from TCX
                                 if mapped_laps and len(mapped_laps) == len(tcx_laps):
                                     for existing, tcx_lap in zip(mapped_laps, tcx_laps):
                                         if not existing.get("avg_hr"):
@@ -331,14 +352,12 @@ async def post_activity_details(request: Request, authorization: Optional[str] =
                                         if not existing.get("max_hr"):
                                             existing["max_hr"] = tcx_lap.get("max_hr")
                                 else:
-                                    # Use TCX laps wholesale
                                     mapped_laps = tcx_laps
                     except Exception as tcx_err:
                         print(f"TCX fallback failed for {activity_id}: {tcx_err}")
 
                 item["laps"] = mapped_laps
 
-                # Weather
                 try:
                     weather = client.get_activity_weather(activity_id)
                     if weather:
@@ -354,7 +373,6 @@ async def post_activity_details(request: Request, authorization: Optional[str] =
                 except Exception:
                     pass
 
-                # GPX → polyline
                 try:
                     gpx_data = client.download_activity(
                         activity_id,
@@ -372,6 +390,8 @@ async def post_activity_details(request: Request, authorization: Optional[str] =
 
         return result
 
+    except HTTPException:
+        raise
     except GarminConnectTooManyRequestsError:
         raise HTTPException(status_code=429, detail="Garmin Rate Limit")
     except Exception as e:
