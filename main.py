@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, Header
 from fastapi.middleware.cors import CORSMiddleware
 from garminconnect import (
     Garmin,
@@ -9,12 +9,15 @@ from garminconnect import (
 import uvicorn
 import os
 import hashlib
+import secrets
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Optional
 import polyline
 import xml.etree.ElementTree as ET
 
 BASE_TOKEN_PATH = os.environ.get("GARMIN_TOKEN_PATH", "/tmp/garmin_tokens")
+SESSION_TTL_DAYS = 365
 
 app = FastAPI()
 
@@ -26,12 +29,37 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# In-memory session store: {token: {"email","password","expires_at"}}
+# NOTE: resets on every Railway redeploy/restart — users will need to reconnect.
+SESSIONS: dict = {}
+
 
 def get_user_token_path(email: str) -> str:
     user_hash = hashlib.sha256(email.lower().strip().encode()).hexdigest()
     path = os.path.join(BASE_TOKEN_PATH, user_hash)
     Path(path).mkdir(parents=True, exist_ok=True)
     return path
+
+
+def cleanup_expired_sessions():
+    now = datetime.utcnow()
+    expired = [t for t, s in SESSIONS.items() if s["expires_at"] < now]
+    for t in expired:
+        SESSIONS.pop(t, None)
+
+
+def get_session(authorization: Optional[str]) -> dict:
+    cleanup_expired_sessions()
+    if not authorization or not authorization.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="Missing bearer token")
+    token = authorization.split(" ", 1)[1].strip()
+    session = SESSIONS.get(token)
+    if not session:
+        raise HTTPException(status_code=401, detail="Invalid or expired session")
+    if session["expires_at"] < datetime.utcnow():
+        SESSIONS.pop(token, None)
+        raise HTTPException(status_code=401, detail="Session expired")
+    return session
 
 
 def parse_gpx_to_polyline(gpx_bytes: bytes) -> str | None:
@@ -54,16 +82,62 @@ def parse_gpx_to_polyline(gpx_bytes: bytes) -> str | None:
         return None
 
 
-@app.post("/garmin-activities")
-async def post_activities(request: Request):
+# ── /garmin-login ──
+@app.post("/garmin-login")
+async def garmin_login(request: Request):
     body = await request.json()
     email = body.get("email")
     password = body.get("password")
-    days = body.get("days", 30)
-    detail_limit = body.get("detail_limit", 0)
 
     if not email or not password:
         raise HTTPException(status_code=400, detail="email and password required")
+
+    try:
+        token_path = get_user_token_path(email)
+        client = Garmin(email=email, password=password)
+        client.login(token_path)
+        try:
+            display_name = client.get_full_name() or email
+        except Exception:
+            display_name = email
+    except GarminConnectTooManyRequestsError:
+        raise HTTPException(status_code=429, detail="Garmin Rate Limit")
+    except (GarminConnectAuthenticationError, GarminConnectConnectionError) as e:
+        raise HTTPException(status_code=401, detail=f"Garmin login failed: {e}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    token = secrets.token_urlsafe(32)
+    expires_at = datetime.utcnow() + timedelta(days=SESSION_TTL_DAYS)
+    SESSIONS[token] = {"email": email, "password": password, "expires_at": expires_at}
+    cleanup_expired_sessions()
+
+    return {
+        "session_token": token,
+        "expires_at": expires_at.isoformat() + "Z",
+        "display_name": display_name,
+    }
+
+
+# ── /garmin-logout ──
+@app.post("/garmin-logout")
+async def garmin_logout(authorization: Optional[str] = Header(None)):
+    if authorization and authorization.lower().startswith("bearer "):
+        token = authorization.split(" ", 1)[1].strip()
+        SESSIONS.pop(token, None)
+    return {"success": True}
+
+
+# ── /garmin-activities (now uses Bearer session token) ──
+@app.post("/garmin-activities")
+async def post_activities(request: Request, authorization: Optional[str] = Header(None)):
+    session = get_session(authorization)
+    email = session["email"]
+    password = session["password"]
+
+    body = await request.json()
+    days = body.get("days", 30)
+    detail_limit = body.get("detail_limit", 0)
 
     try:
         token_path = get_user_token_path(email)
@@ -117,15 +191,15 @@ async def post_activities(request: Request):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# ── /garmin-activity-details (now uses Bearer session token) ──
 @app.post("/garmin-activity-details")
-async def post_activity_details(request: Request):
-    body = await request.json()
-    email = body.get("email")
-    password = body.get("password")
-    activity_ids = body.get("activity_ids", "")
+async def post_activity_details(request: Request, authorization: Optional[str] = Header(None)):
+    session = get_session(authorization)
+    email = session["email"]
+    password = session["password"]
 
-    if not email or not password:
-        raise HTTPException(status_code=400, detail="email and password required")
+    body = await request.json()
+    activity_ids = body.get("activity_ids", "")
 
     try:
         token_path = get_user_token_path(email)
