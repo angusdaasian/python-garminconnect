@@ -82,6 +82,81 @@ def parse_gpx_to_polyline(gpx_bytes: bytes) -> str | None:
         return None
 
 
+def parse_tcx_laps(tcx_bytes: bytes) -> list:
+    """Parse TCX file and extract per-lap data including HR. Most reliable HR source."""
+    try:
+        root = ET.fromstring(tcx_bytes)
+        # TCX uses a namespace
+        ns = {"tcx": "http://www.garmin.com/xmlschemas/TrainingCenterDatabase/v2"}
+        laps = []
+        for idx, lap_el in enumerate(root.findall(".//tcx:Lap", ns), start=1):
+            def _find_float(tag):
+                el = lap_el.find(f"tcx:{tag}", ns)
+                return float(el.text) if el is not None and el.text else None
+
+            def _find_int_in(parent_tag, child_tag):
+                parent = lap_el.find(f"tcx:{parent_tag}", ns)
+                if parent is None:
+                    return None
+                child = parent.find(f"tcx:{child_tag}", ns)
+                return int(child.text) if child is not None and child.text else None
+
+            total_time = _find_float("TotalTimeSeconds") or 0
+            distance = _find_float("DistanceMeters") or 0
+            max_speed = _find_float("MaximumSpeed")
+            calories_el = lap_el.find("tcx:Calories", ns)
+            calories = int(calories_el.text) if calories_el is not None and calories_el.text else None
+
+            avg_hr = _find_int_in("AverageHeartRateBpm", "Value")
+            max_hr = _find_int_in("MaximumHeartRateBpm", "Value")
+
+            avg_speed = (distance / total_time) if total_time > 0 else None
+            pace_sec_per_km = (total_time / (distance / 1000)) if distance > 0 else None
+
+            laps.append({
+                "split_number": idx,
+                "distance": distance,
+                "elapsed_time": total_time,
+                "moving_time": total_time,
+                "avg_hr": avg_hr,
+                "max_hr": max_hr,
+                "avg_speed": avg_speed,
+                "max_speed": max_speed,
+                "avg_pace_sec_per_km": round(pace_sec_per_km, 1) if pace_sec_per_km else None,
+                "avg_cadence": None,
+                "elevation_gain": 0,
+                "elevation_loss": 0,
+                "calories": calories,
+            })
+        return laps
+    except Exception as e:
+        print(f"TCX parse error: {e}")
+        return []
+
+
+def map_lap_dto(lap: dict, idx: int) -> dict:
+    """Map a Garmin lapDTO into our normalized lap shape."""
+    distance_m = lap.get("distance") or 0
+    elapsed_s = lap.get("elapsedDuration") or lap.get("duration") or 0
+    avg_speed = lap.get("averageSpeed")
+    pace_sec_per_km = (elapsed_s / (distance_m / 1000)) if distance_m > 0 else None
+    return {
+        "split_number": lap.get("lapIndex") or idx,
+        "distance": distance_m,
+        "elapsed_time": elapsed_s,
+        "moving_time": lap.get("movingDuration"),
+        "avg_hr": lap.get("averageHR") or lap.get("averageHeartRate") or lap.get("avgHr"),
+        "max_hr": lap.get("maxHR") or lap.get("maxHeartRate") or lap.get("maxHr"),
+        "avg_speed": avg_speed,
+        "max_speed": lap.get("maxSpeed"),
+        "avg_pace_sec_per_km": round(pace_sec_per_km, 1) if pace_sec_per_km else None,
+        "avg_cadence": lap.get("averageRunCadence") or lap.get("averageRunningCadenceInStepsPerMinute"),
+        "elevation_gain": int(lap.get("elevationGain") or 0),
+        "elevation_loss": int(lap.get("elevationLoss") or 0),
+        "calories": lap.get("calories"),
+    }
+
+
 # ── /garmin-login ──
 @app.post("/garmin-login")
 async def garmin_login(request: Request):
@@ -128,7 +203,7 @@ async def garmin_logout(authorization: Optional[str] = Header(None)):
     return {"success": True}
 
 
-# ── /garmin-activities (now uses Bearer session token) ──
+# ── /garmin-activities ──
 @app.post("/garmin-activities")
 async def post_activities(request: Request, authorization: Optional[str] = Header(None)):
     session = get_session(authorization)
@@ -137,7 +212,6 @@ async def post_activities(request: Request, authorization: Optional[str] = Heade
 
     body = await request.json()
     days = body.get("days", 30)
-    detail_limit = body.get("detail_limit", 0)
 
     try:
         token_path = get_user_token_path(email)
@@ -191,7 +265,7 @@ async def post_activities(request: Request, authorization: Optional[str] = Heade
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# ── /garmin-activity-details (now uses Bearer session token) ──
+# ── /garmin-activity-details ──
 @app.post("/garmin-activity-details")
 async def post_activity_details(request: Request, authorization: Optional[str] = Header(None)):
     session = get_session(authorization)
@@ -213,17 +287,58 @@ async def post_activity_details(request: Request, authorization: Optional[str] =
             try:
                 item = {"laps": [], "weather": None, "map_polyline": None}
 
-                splits_data = client.get_activity_splits(activity_id)
-                for lap in splits_data.get("lapDTOs", []):
-                    item["laps"].append({
-                        "split_number": lap.get("lapIndex"),
-                        "distance": lap.get("distance"),
-                        "elapsed_time": lap.get("elapsedDuration"),
-                        "avg_hr": lap.get("averageHeartRate"),
-                        "avg_speed": lap.get("averageSpeed"),
-                        "elevation_gain": int(lap.get("elevationGain", 0)) if lap.get("elevationGain") else 0,
-                    })
+                # ── 3-tier lap fetch: laps → splits → TCX ──
+                mapped_laps = []
 
+                # Tier 1: get_activity_laps (manual lap-button presses)
+                try:
+                    laps_data = client.get_activity_laps(activity_id)
+                    raw_laps = laps_data.get("lapDTOs", []) or []
+                    if raw_laps:
+                        mapped_laps = [map_lap_dto(lap, i + 1) for i, lap in enumerate(raw_laps)]
+                except Exception as e:
+                    print(f"get_activity_laps failed for {activity_id}: {e}")
+
+                # Tier 2: get_activity_splits (auto 1km/mile splits)
+                if not mapped_laps:
+                    try:
+                        splits_data = client.get_activity_splits(activity_id)
+                        raw_splits = splits_data.get("lapDTOs", []) or []
+                        if raw_splits:
+                            mapped_laps = [map_lap_dto(lap, i + 1) for i, lap in enumerate(raw_splits)]
+                    except Exception as e:
+                        print(f"get_activity_splits failed for {activity_id}: {e}")
+
+                # Tier 3: TCX fallback (most reliable for HR)
+                # Trigger if we have NO laps OR laps are missing HR data
+                needs_tcx_fallback = not mapped_laps or all(
+                    not lap.get("avg_hr") for lap in mapped_laps
+                )
+                if needs_tcx_fallback:
+                    try:
+                        tcx_data = client.download_activity(
+                            activity_id,
+                            dl_fmt=client.ActivityDownloadFormat.TCX
+                        )
+                        if tcx_data:
+                            tcx_laps = parse_tcx_laps(tcx_data)
+                            if tcx_laps:
+                                # If we already have laps but missing HR, merge HR from TCX
+                                if mapped_laps and len(mapped_laps) == len(tcx_laps):
+                                    for existing, tcx_lap in zip(mapped_laps, tcx_laps):
+                                        if not existing.get("avg_hr"):
+                                            existing["avg_hr"] = tcx_lap.get("avg_hr")
+                                        if not existing.get("max_hr"):
+                                            existing["max_hr"] = tcx_lap.get("max_hr")
+                                else:
+                                    # Use TCX laps wholesale
+                                    mapped_laps = tcx_laps
+                    except Exception as tcx_err:
+                        print(f"TCX fallback failed for {activity_id}: {tcx_err}")
+
+                item["laps"] = mapped_laps
+
+                # Weather
                 try:
                     weather = client.get_activity_weather(activity_id)
                     if weather:
@@ -239,6 +354,7 @@ async def post_activity_details(request: Request, authorization: Optional[str] =
                 except Exception:
                     pass
 
+                # GPX → polyline
                 try:
                     gpx_data = client.download_activity(
                         activity_id,
