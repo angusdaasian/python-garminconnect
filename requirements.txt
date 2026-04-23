@@ -1,7 +1,7 @@
 fastapi
 uvicorn[standard]
-garminconnect>=0.3.3
-garth>=0.5.0
+garth>=0.4.46
+garminconnect>=0.2.20
 curl_cffi
 pydantic
 polyline
