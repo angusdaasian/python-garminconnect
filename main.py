@@ -6,11 +6,11 @@ from garminconnect import (
     GarminConnectConnectionError,
     GarminConnectTooManyRequestsError,
 )
+import garth
 import uvicorn
 import os
 import hashlib
 import threading
-import queue
 import uuid
 import time
 from datetime import datetime, timedelta
@@ -31,7 +31,8 @@ app.add_middleware(
 )
 
 # ─── In-memory MFA session store ──────────────────────────────────────────────
-# session_id -> {"code_q": Queue, "result_q": Queue, "thread": Thread, "created": ts}
+# session_id -> {"client_state": dict, "signin_params": dict, "email": str,
+#                 "token_path": str, "created": float}
 _mfa_sessions: dict[str, dict] = {}
 _mfa_lock = threading.Lock()
 
@@ -107,58 +108,36 @@ async def garmin_login(request: Request):
         raise HTTPException(status_code=400, detail="email and password required")
 
     token_path = get_user_token_path(email)
-    code_q: queue.Queue = queue.Queue(maxsize=1)
-    result_q: queue.Queue = queue.Queue(maxsize=1)
+    garth_client = garth.Client()
 
-    def prompt_mfa() -> str:
-        # Blocks until /garmin-login-mfa puts a code on the queue
-        return code_q.get(timeout=MFA_SESSION_TTL_SECONDS)
+    try:
+        # garth supports return_on_mfa=True since 0.4.x — returns
+        # ("needs_mfa", {"client_state": ..., "signin_params": ...}) when MFA is required.
+        result = garth_client.login(email, password, return_on_mfa=True)
+    except Exception as e:
+        msg = str(e).lower()
+        if "rate" in msg or "429" in msg:
+            raise HTTPException(status_code=429, detail="Garmin rate limit")
+        raise HTTPException(status_code=401, detail=f"Garmin auth failed: {e}")
 
-    def run_login():
-        try:
-            client = Garmin(email=email, password=password, prompt_mfa=prompt_mfa)
-            client.login(token_path)
-            result_q.put({"ok": True})
-        except GarminConnectAuthenticationError as e:
-            result_q.put({"ok": False, "status": 401, "detail": f"Garmin auth failed: {e}"})
-        except GarminConnectTooManyRequestsError:
-            result_q.put({"ok": False, "status": 429, "detail": "Garmin rate limit"})
-        except queue.Empty:
-            result_q.put({"ok": False, "status": 408, "detail": "MFA code timeout"})
-        except Exception as e:
-            result_q.put({"ok": False, "status": 500, "detail": str(e)})
+    needs_mfa = isinstance(result, tuple) and len(result) == 2 and result[0] == "needs_mfa"
 
-    thread = threading.Thread(target=run_login, daemon=True)
-    thread.start()
+    if needs_mfa:
+        mfa_state = result[1]  # contains client_state + signin_params
+        session_id = str(uuid.uuid4())
+        with _mfa_lock:
+            _mfa_sessions[session_id] = {
+                "garth_client": garth_client,
+                "mfa_state": mfa_state,
+                "email": email,
+                "token_path": token_path,
+                "created": time.time(),
+            }
+        return {"success": True, "needs_mfa": True, "session_id": session_id}
 
-    # Give the login thread a moment to either finish (no MFA) or block on prompt_mfa
-    # Poll up to ~15s for completion, otherwise assume MFA is being awaited.
-    for _ in range(30):
-        try:
-            result = result_q.get(timeout=0.5)
-            # Login completed (success or failure) without MFA
-            if result["ok"]:
-                return {"success": True, "needs_mfa": False}
-            raise HTTPException(status_code=result["status"], detail=result["detail"])
-        except queue.Empty:
-            if not thread.is_alive():
-                raise HTTPException(status_code=500, detail="Login thread died unexpectedly")
-            # Heuristic: if the code queue is being awaited, MFA is needed
-            # We can't directly inspect waiters, so assume MFA after the thread is still alive
-            # and we've waited a short interval with no result.
-            # A simpler signal: try again next loop. If thread is still alive after the loop, assume MFA.
-            continue
-
-    # If we reach here, login is still pending — assume MFA prompt is active
-    session_id = str(uuid.uuid4())
-    with _mfa_lock:
-        _mfa_sessions[session_id] = {
-            "code_q": code_q,
-            "result_q": result_q,
-            "thread": thread,
-            "created": time.time(),
-        }
-    return {"success": True, "needs_mfa": True, "session_id": session_id}
+    # No MFA — already logged in, persist tokens
+    garth_client.dump(token_path)
+    return {"success": True, "needs_mfa": False}
 
 
 # ─── /garmin-login-mfa (step 2) ───────────────────────────────────────────────
@@ -180,19 +159,19 @@ async def garmin_login_mfa(request: Request):
     if not session:
         raise HTTPException(status_code=404, detail="MFA session not found or expired")
 
-    try:
-        session["code_q"].put_nowait(str(mfa_code).strip())
-    except queue.Full:
-        raise HTTPException(status_code=409, detail="MFA code already submitted")
+    garth_client: garth.Client = session["garth_client"]
+    mfa_state = session["mfa_state"]
+    token_path = session["token_path"]
 
     try:
-        result = session["result_q"].get(timeout=30)
-    except queue.Empty:
-        raise HTTPException(status_code=504, detail="Garmin login timed out after MFA")
+        garth_client.resume_login(mfa_state, str(mfa_code).strip())
+        garth_client.dump(token_path)
+    except Exception as e:
+        # Re-store session so user can retry once if it was a typo? No — Garmin
+        # invalidates the SSO state after a failed attempt. They must restart.
+        raise HTTPException(status_code=401, detail=f"MFA verification failed: {e}")
 
-    if result["ok"]:
-        return {"success": True}
-    raise HTTPException(status_code=result["status"], detail=result["detail"])
+    return {"success": True}
 
 
 # ─── /garmin-activities (token-based) ─────────────────────────────────────────
@@ -362,4 +341,6 @@ async def post_activity_details(request: Request):
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    # IMPORTANT: keep workers=1 so the in-memory _mfa_sessions dict is shared
+    # between /garmin-login and /garmin-login-mfa requests.
+    uvicorn.run(app, host="0.0.0.0", port=port, workers=1)
