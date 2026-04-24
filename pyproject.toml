@@ -1,6 +1,6 @@
 [project]
 name = "garminconnect"
-version = "0.3.2"
+version = "0.3.3"
 description = "Python 3 API wrapper for Garmin Connect"
 authors = [
     {name = "Ron Klinkien", email = "ron@cyberjunky.nl"},
@@ -25,7 +25,7 @@ classifiers = [
     "Operating System :: OS Independent",
 ]
 keywords=["garmin connect", "api", "garmin"]
-requires-python=">=3.10"
+requires-python=">=3.12"
 [project.urls]
 "Homepage" = "https://github.com/cyberjunky/python-garminconnect"
 "Issues" = "https://github.com/cyberjunky/python-garminconnect/issues"
@@ -40,9 +40,25 @@ addopts = "--ignore=__pypackages__ --ignore-glob=*.yaml"
 
 [tool.mypy]
 ignore_missing_imports = true
-python_version = "3.10"
+python_version = "3.12"
 disallow_untyped_defs = true
 warn_unused_ignores = true
+
+[[tool.mypy.overrides]]
+# Tests deliberately omit return-type annotations (per repo convention
+# established by PR #351) and stub out client methods via monkeypatch /
+# direct attribute assignment, which mypy can't reason about. We list
+# each test module explicitly because ``tests/`` has no __init__.py and
+# mypy's glob patterns are unreliable for non-package directories.
+module = [
+    "test_garmin",
+    "test_garmin_unit",
+    "test_retry_decorator",
+    "test_workout_constants",
+    "conftest",
+]
+disallow_untyped_defs = false
+warn_unused_ignores = false
 
 [tool.isort]
 profile = "black"
@@ -67,6 +83,8 @@ linting = [
     "mypy",
     "isort",
     "types-requests",
+    "pre-commit",
+    "codespell",
 ]
 testing = [
     "coverage",
@@ -90,7 +108,7 @@ excludes = [
 
 [tool.ruff]
 line-length = 88
-target-version = "py310"
+target-version = "py312"
 exclude = [
     ".git",
     ".venv",
@@ -167,7 +185,7 @@ ignore = [
 unfixable = []  # Allow all fixes, including unsafe ones
 
 [tool.ruff.lint.per-file-ignores]
-"tests/*" = ["ARG", "S101"]
+"tests/*" = ["ARG", "S101", "D103"]
 "garminconnect/fit.py" = ["D", "RUF012", "PLW2901"]  # FIT protocol utility - stable, minimal docs
 "garminconnect/workout.py" = ["D401"]  # Pydantic models - docstring mood is fine
 "demo.py" = ["T20", "S101", "ERA", "RUF001", "PTH", "PERF401", "PERF203", "PLR0911", "D103"]  # Demo script - various user-facing patterns
