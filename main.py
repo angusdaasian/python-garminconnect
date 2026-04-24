@@ -8,8 +8,10 @@ from garminconnect import (
 )
 import uvicorn
 import os
+import sys
 import json
 import base64
+import traceback
 from datetime import datetime, timedelta
 import polyline
 import xml.etree.ElementTree as ET
@@ -24,10 +26,13 @@ app.add_middleware(
 )
 
 
-# ─── Token serialization ──────────────────────────────────────────────────────
-# After login, garmin.garth.dumps() returns a base64 string holding both
-# OAuth1 + OAuth2 tokens. Restore by passing it to garmin.login(blob).
+def log(msg: str):
+    """Force-flush print so Railway shows logs immediately."""
+    print(msg, flush=True)
+    sys.stdout.flush()
 
+
+# ─── Token serialization ──────────────────────────────────────────────────────
 def dump_session(client: Garmin) -> str:
     return client.garth.dumps()
 
@@ -39,12 +44,14 @@ def restore_client(token_blob: str) -> Garmin:
 
 
 # ─── MFA state serialization (stateless) ──────────────────────────────────────
-# garmin.login(return_on_mfa=True) returns (result, client_state) where
-# client_state is a small JSON-serializable dict. We base64-encode it so the
-# frontend can hold it between login + MFA submit. No server-side session.
-
-def encode_mfa_state(client_state: dict) -> str:
-    return base64.b64encode(json.dumps(client_state).encode()).decode()
+def encode_mfa_state(client_state) -> str:
+    # client_state from garminconnect may be a dict OR an object — coerce to JSON-safe.
+    if hasattr(client_state, "__dict__") and not isinstance(client_state, dict):
+        try:
+            client_state = client_state.__dict__
+        except Exception:
+            pass
+    return base64.b64encode(json.dumps(client_state, default=str).encode()).decode()
 
 
 def decode_mfa_state(blob: str) -> dict:
@@ -67,13 +74,18 @@ def parse_gpx_to_polyline(gpx_bytes: bytes) -> str | None:
             coords = coords[::step]
         return polyline.encode(coords)
     except Exception as e:
-        print(f"GPX parse error: {e}")
+        log(f"GPX parse error: {e}")
         return None
 
 
 @app.get("/")
 async def root():
-    return {"status": "ok"}
+    try:
+        import garminconnect as gc
+        version = getattr(gc, "__version__", "unknown")
+    except Exception:
+        version = "unknown"
+    return {"status": "ok", "garminconnect_version": version}
 
 
 # ─── /garmin-login (step 1) ───────────────────────────────────────────────────
@@ -85,23 +97,34 @@ async def garmin_login(request: Request):
     if not email or not password:
         raise HTTPException(status_code=400, detail="email and password required")
 
+    log(f"[LOGIN] start for {email}")
+
     try:
         garmin = Garmin(email=email, password=password, return_on_mfa=True)
         result = garmin.login()
+        log(f"[LOGIN] login() returned type={type(result).__name__}, value={result if not isinstance(result, tuple) else 'tuple(len=' + str(len(result)) + ')'}")
 
-        # Official garminconnect MFA pattern: result is a tuple
-        # (status, client_state) when MFA is required.
+        # garminconnect returns a tuple ("needs_mfa", client_state) when MFA is required.
         if isinstance(result, tuple) and len(result) == 2 and result[0] == "needs_mfa":
             _, client_state = result
-            print(f"MFA required for {email}")
+            log(f"[LOGIN] MFA required, client_state type={type(client_state).__name__}")
+            try:
+                state_blob = encode_mfa_state(client_state)
+                log(f"[LOGIN] encoded client_state, length={len(state_blob)}")
+            except Exception as e:
+                log(f"[LOGIN] FAILED to encode client_state: {e}")
+                traceback.print_exc()
+                raise HTTPException(status_code=500, detail=f"Cannot serialize MFA state: {e}")
+
             return {
                 "success": True,
                 "needs_mfa": True,
-                "mfa_state": encode_mfa_state(client_state),
+                "mfa_state": state_blob,
             }
 
         # No MFA — login completed
         blob = dump_session(garmin)
+        log(f"[LOGIN] no MFA, login complete")
         return {
             "success": True,
             "needs_mfa": False,
@@ -110,193 +133,57 @@ async def garmin_login(request: Request):
         }
 
     except GarminConnectAuthenticationError as e:
+        log(f"[LOGIN] auth error: {e}")
         raise HTTPException(status_code=401, detail=f"Garmin auth failed: {e}")
     except GarminConnectTooManyRequestsError as e:
+        log(f"[LOGIN] rate limit: {e}")
         raise HTTPException(status_code=429, detail=f"Garmin rate limit: {e}")
     except HTTPException:
         raise
     except Exception as e:
+        log(f"[LOGIN] UNEXPECTED ERROR: {type(e).__name__}: {e}")
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
 
 
 # ─── /garmin-login-mfa (step 2) ───────────────────────────────────────────────
 @app.post("/garmin-login-mfa")
 async def garmin_login_mfa(request: Request):
-    body = await request.json()
+    log("[MFA] ===== /garmin-login-mfa called =====")
+    try:
+        body = await request.json()
+    except Exception as e:
+        log(f"[MFA] failed to parse body: {e}")
+        raise HTTPException(status_code=400, detail=f"Invalid JSON body: {e}")
+
     mfa_state_blob = body.get("mfa_state")
     mfa_code = body.get("mfa_code")
     email = body.get("email")
     password = body.get("password")
 
+    log(f"[MFA] received: has_state={bool(mfa_state_blob)}, has_code={bool(mfa_code)}, has_email={bool(email)}, has_password={bool(password)}")
+
     if not mfa_state_blob or not mfa_code:
         raise HTTPException(status_code=400, detail="mfa_state and mfa_code required")
 
+    if not email or not password:
+        log("[MFA] missing email/password — resume_login may need them")
+        raise HTTPException(status_code=400, detail="email and password required for resume")
+
     try:
         client_state = decode_mfa_state(mfa_state_blob)
+        log(f"[MFA] decoded client_state, type={type(client_state).__name__}, keys={list(client_state.keys()) if isinstance(client_state, dict) else 'n/a'}")
     except Exception as e:
+        log(f"[MFA] decode error: {e}")
         raise HTTPException(status_code=400, detail=f"Invalid mfa_state: {e}")
 
     try:
-        # Recreate the client with same credentials, then resume with the code.
-        garmin = Garmin(email=email or "", password=password or "", return_on_mfa=True)
-        garmin.resume_login(client_state, str(mfa_code).strip())
+        log("[MFA] constructing Garmin client with return_on_mfa=True")
+        garmin = Garmin(email=email, password=password, return_on_mfa=True)
 
+        log("[MFA] calling resume_login...")
+        result = garmin.resume_login(client_state, str(mfa_code).strip())
+        log(f"[MFA] resume_login returned type={type(result).__name__}")
+
+        log("[MFA] dumping session tokens")
         blob = dump_session(garmin)
-        return {
-            "success": True,
-            "oauth1_token": blob,
-            "oauth2_token": blob,
-        }
-
-    except GarminConnectAuthenticationError as e:
-        raise HTTPException(status_code=401, detail=f"MFA verification failed: {e}")
-    except GarminConnectTooManyRequestsError as e:
-        raise HTTPException(status_code=429, detail=f"Garmin rate limit: {e}")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
-
-
-# ─── /garmin-activities ───────────────────────────────────────────────────────
-@app.post("/garmin-activities")
-async def post_activities(request: Request):
-    body = await request.json()
-    email = body.get("email")
-    oauth1_token = body.get("oauth1_token")
-    days = body.get("days", 30)
-
-    if not email or not oauth1_token:
-        raise HTTPException(status_code=400, detail="email and oauth1_token required")
-
-    try:
-        try:
-            client = restore_client(oauth1_token)
-        except Exception as e:
-            raise HTTPException(status_code=401, detail=f"Invalid Garmin tokens: {type(e).__name__}: {e}")
-
-        end_date = datetime.now()
-        start_date = end_date - timedelta(days=days)
-
-        activities = client.get_activities_by_date(
-            start_date.strftime("%Y-%m-%d"),
-            end_date.strftime("%Y-%m-%d"),
-        )
-
-        results = []
-        for a in activities:
-            sport = a.get("activityType", {}).get("typeKey", "unknown")
-            duration = a.get("duration", 0) or 0
-            distance = a.get("distance", 0) or 0
-            avg_speed = (distance / duration) if duration > 0 else 0
-            avg_pace = (duration / 60 / (distance / 1000)) if distance > 0 else None
-
-            results.append({
-                "garmin_activity_id": str(a.get("activityId", "")),
-                "activity_name": a.get("activityName", "Garmin Activity"),
-                "activity_type": sport,
-                "start_time": a.get("startTimeLocal", a.get("startTimeGMT")),
-                "duration_seconds": round(duration),
-                "distance_meters": round(distance, 2),
-                "calories": a.get("calories"),
-                "average_hr": a.get("averageHR"),
-                "max_hr": a.get("maxHR"),
-                "elevation_gain": a.get("elevationGain"),
-                "average_speed": round(avg_speed, 4),
-                "average_pace": round(avg_pace, 2) if avg_pace else None,
-                "avg_cadence": a.get("averageRunningCadenceInStepsPerMinute"),
-                "aerobic_te": a.get("aerobicTrainingEffect"),
-                "anaerobic_te": a.get("anaerobicTrainingEffect"),
-                "vo2max": a.get("vO2MaxValue"),
-                "training_load": a.get("activityTrainingLoad"),
-                "has_gps": a.get("hasPolyline", False),
-            })
-
-        return results
-
-    except HTTPException:
-        raise
-    except GarminConnectTooManyRequestsError:
-        raise HTTPException(status_code=429, detail="Garmin Rate Limit")
-    except (GarminConnectAuthenticationError, GarminConnectConnectionError) as e:
-        raise HTTPException(status_code=401, detail=f"Garmin session expired: {e}")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
-
-
-# ─── /garmin-activity-details ─────────────────────────────────────────────────
-@app.post("/garmin-activity-details")
-async def post_activity_details(request: Request):
-    body = await request.json()
-    email = body.get("email")
-    oauth1_token = body.get("oauth1_token")
-    activity_ids = body.get("activity_ids", "")
-
-    if not email or not oauth1_token:
-        raise HTTPException(status_code=400, detail="email and oauth1_token required")
-
-    try:
-        try:
-            client = restore_client(oauth1_token)
-        except Exception as e:
-            raise HTTPException(status_code=401, detail=f"Invalid Garmin tokens: {type(e).__name__}: {e}")
-
-        ids = [aid.strip() for aid in activity_ids.split(",") if aid.strip()]
-        result = {}
-
-        for activity_id in ids:
-            try:
-                item = {"laps": [], "weather": None, "map_polyline": None}
-
-                splits_data = client.get_activity_splits(activity_id)
-                for lap in splits_data.get("lapDTOs", []):
-                    item["laps"].append({
-                        "split_number": lap.get("lapIndex"),
-                        "distance": lap.get("distance"),
-                        "elapsed_time": lap.get("elapsedDuration"),
-                        "avg_hr": lap.get("averageHeartRate"),
-                        "avg_speed": lap.get("averageSpeed"),
-                        "elevation_gain": int(lap.get("elevationGain", 0)) if lap.get("elevationGain") else 0,
-                    })
-
-                try:
-                    weather = client.get_activity_weather(activity_id)
-                    if weather:
-                        item["weather"] = {
-                            "temp": weather.get("temp"),
-                            "apparent_temp": weather.get("apparentTemp"),
-                            "humidity": weather.get("relativeHumidity"),
-                            "wind_speed": weather.get("windSpeed"),
-                            "wind_direction": weather.get("windDirection"),
-                            "weather_type": weather.get("weatherTypeName"),
-                            "condition": weather.get("weatherTypeDTO", {}).get("desc") if weather.get("weatherTypeDTO") else None,
-                        }
-                except Exception:
-                    pass
-
-                try:
-                    gpx_data = client.download_activity(
-                        activity_id,
-                        dl_fmt=client.ActivityDownloadFormat.GPX,
-                    )
-                    if gpx_data:
-                        item["map_polyline"] = parse_gpx_to_polyline(gpx_data)
-                except Exception as gpx_err:
-                    print(f"GPX download failed for {activity_id}: {gpx_err}")
-
-                result[str(activity_id)] = item
-            except Exception as e:
-                print(f"Skipping details for {activity_id}: {e}")
-                result[str(activity_id)] = None
-
-        return result
-
-    except HTTPException:
-        raise
-    except GarminConnectTooManyRequestsError:
-        raise HTTPException(status_code=429, detail="Garmin Rate Limit")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
-
-
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
