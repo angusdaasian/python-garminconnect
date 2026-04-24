@@ -230,4 +230,73 @@ async def post_activity_details(request: Request):
     oauth1_token = body.get("oauth1_token")
     activity_ids = body.get("activity_ids", "")
 
-    if not email or not oaut
+    if not email or not oauth1_token:
+        raise HTTPException(status_code=400, detail="email and oauth1_token required")
+
+    try:
+        try:
+            client = restore_client(oauth1_token)
+        except Exception as e:
+            raise HTTPException(status_code=401, detail=f"Invalid Garmin tokens: {type(e).__name__}: {e}")
+
+        ids = [aid.strip() for aid in activity_ids.split(",") if aid.strip()]
+        result = {}
+
+        for activity_id in ids:
+            try:
+                item = {"laps": [], "weather": None, "map_polyline": None}
+
+                splits_data = client.get_activity_splits(activity_id)
+                for lap in splits_data.get("lapDTOs", []):
+                    item["laps"].append({
+                        "split_number": lap.get("lapIndex"),
+                        "distance": lap.get("distance"),
+                        "elapsed_time": lap.get("elapsedDuration"),
+                        "avg_hr": lap.get("averageHeartRate"),
+                        "avg_speed": lap.get("averageSpeed"),
+                        "elevation_gain": int(lap.get("elevationGain", 0)) if lap.get("elevationGain") else 0,
+                    })
+
+                try:
+                    weather = client.get_activity_weather(activity_id)
+                    if weather:
+                        item["weather"] = {
+                            "temp": weather.get("temp"),
+                            "apparent_temp": weather.get("apparentTemp"),
+                            "humidity": weather.get("relativeHumidity"),
+                            "wind_speed": weather.get("windSpeed"),
+                            "wind_direction": weather.get("windDirection"),
+                            "weather_type": weather.get("weatherTypeName"),
+                            "condition": weather.get("weatherTypeDTO", {}).get("desc") if weather.get("weatherTypeDTO") else None,
+                        }
+                except Exception:
+                    pass
+
+                try:
+                    gpx_data = client.download_activity(
+                        activity_id,
+                        dl_fmt=client.ActivityDownloadFormat.GPX,
+                    )
+                    if gpx_data:
+                        item["map_polyline"] = parse_gpx_to_polyline(gpx_data)
+                except Exception as gpx_err:
+                    print(f"GPX download failed for {activity_id}: {gpx_err}")
+
+                result[str(activity_id)] = item
+            except Exception as e:
+                print(f"Skipping details for {activity_id}: {e}")
+                result[str(activity_id)] = None
+
+        return result
+
+    except HTTPException:
+        raise
+    except GarminConnectTooManyRequestsError:
+        raise HTTPException(status_code=429, detail="Garmin Rate Limit")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
+
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
