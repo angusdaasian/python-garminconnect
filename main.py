@@ -8,17 +8,14 @@ from garminconnect import (
 )
 import uvicorn
 import os
-import hashlib
 import threading
 import queue
 import uuid
 import time
 from datetime import datetime, timedelta
-from pathlib import Path
 import polyline
 import xml.etree.ElementTree as ET
 
-BASE_TOKEN_PATH = os.environ.get("GARMIN_TOKEN_PATH", "/tmp/garmin_tokens")
 MFA_SESSION_TTL_SECONDS = 300  # 5 min for the user to enter the code
 
 app = FastAPI()
@@ -31,7 +28,7 @@ app.add_middleware(
 )
 
 # ─── In-memory MFA session store ──────────────────────────────────────────────
-# session_id -> {"code_q", "result_q", "thread", "created"}
+# session_id -> {"code_q", "result_q", "thread", "client_holder", "created"}
 _mfa_sessions: dict[str, dict] = {}
 _mfa_lock = threading.Lock()
 
@@ -45,28 +42,28 @@ def _cleanup_mfa_sessions():
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
-def get_user_token_path(email: str) -> str:
-    user_hash = hashlib.sha256(email.lower().strip().encode()).hexdigest()
-    path = os.path.join(BASE_TOKEN_PATH, user_hash)
-    Path(path).mkdir(parents=True, exist_ok=True)
-    return path
-
-
-def has_stored_tokens(token_path: str) -> bool:
-    return (
-        Path(token_path, "oauth1_token.json").exists()
-        and Path(token_path, "oauth2_token.json").exists()
-    )
-
-
-def login_with_tokens(email: str) -> Garmin:
-    """Login using stored tokens only. Raises if tokens missing/expired."""
-    token_path = get_user_token_path(email)
-    if not has_stored_tokens(token_path):
-        raise GarminConnectAuthenticationError("No stored tokens for user")
+def client_from_tokens(oauth1_token: str, oauth2_token: str) -> Garmin:
+    """
+    Rebuild a Garmin client from previously-issued OAuth tokens (JSON strings).
+    No disk I/O — tokens live in Supabase.
+    """
+    import garth
     client = Garmin()
-    client.login(token_path)  # loads tokens from disk and refreshes
+    client.garth.oauth1_token = garth.auth_tokens.OAuth1Token.from_json(oauth1_token)
+    client.garth.oauth2_token = garth.auth_tokens.OAuth2Token.from_json(oauth2_token)
+    # Pull the username/profile so subsequent calls have what they need
+    try:
+        client.garth.username  # property triggers lazy load
+    except Exception:
+        pass
     return client
+
+
+def tokens_from_client(client: Garmin) -> tuple[str, str]:
+    """Serialize the live client's tokens to JSON strings for storage."""
+    oauth1 = client.garth.oauth1_token.to_json()
+    oauth2 = client.garth.oauth2_token.to_json()
+    return oauth1, oauth2
 
 
 def parse_gpx_to_polyline(gpx_bytes: bytes) -> str | None:
@@ -95,7 +92,7 @@ async def garmin_login(request: Request):
     """
     Step 1.
     Body:     { email, password }
-    No MFA:   { success: true, needs_mfa: false }
+    No MFA:   { success: true, needs_mfa: false, oauth1_token, oauth2_token }
     MFA:      { success: true, needs_mfa: true, session_id }
     """
     _cleanup_mfa_sessions()
@@ -105,18 +102,18 @@ async def garmin_login(request: Request):
     if not email or not password:
         raise HTTPException(status_code=400, detail="email and password required")
 
-    token_path = get_user_token_path(email)
     code_q: queue.Queue = queue.Queue(maxsize=1)
     result_q: queue.Queue = queue.Queue(maxsize=1)
+    client_holder: dict = {}
 
     def prompt_mfa() -> str:
-        # Blocks until /garmin-login-mfa pushes a code
         return code_q.get(timeout=MFA_SESSION_TTL_SECONDS)
 
     def run_login():
         try:
             client = Garmin(email=email, password=password, prompt_mfa=prompt_mfa)
-            client.login(token_path)
+            client.login()  # no path → in-memory only
+            client_holder["client"] = client
             result_q.put({"ok": True})
         except GarminConnectAuthenticationError as e:
             result_q.put({"ok": False, "status": 401, "detail": f"Garmin auth failed: {e}"})
@@ -135,7 +132,14 @@ async def garmin_login(request: Request):
         try:
             result = result_q.get(timeout=0.5)
             if result["ok"]:
-                return {"success": True, "needs_mfa": False}
+                client = client_holder["client"]
+                oauth1, oauth2 = tokens_from_client(client)
+                return {
+                    "success": True,
+                    "needs_mfa": False,
+                    "oauth1_token": oauth1,
+                    "oauth2_token": oauth2,
+                }
             raise HTTPException(status_code=result["status"], detail=result["detail"])
         except queue.Empty:
             if not thread.is_alive():
@@ -148,6 +152,7 @@ async def garmin_login(request: Request):
             "code_q": code_q,
             "result_q": result_q,
             "thread": thread,
+            "client_holder": client_holder,
             "created": time.time(),
         }
     return {"success": True, "needs_mfa": True, "session_id": session_id}
@@ -157,8 +162,9 @@ async def garmin_login(request: Request):
 @app.post("/garmin-login-mfa")
 async def garmin_login_mfa(request: Request):
     """
-    Step 2 (only if step 1 returned needs_mfa).
-    Body: { session_id, mfa_code }
+    Step 2.
+    Body:    { session_id, mfa_code }
+    Success: { success: true, oauth1_token, oauth2_token }
     """
     body = await request.json()
     session_id = body.get("session_id")
@@ -181,35 +187,36 @@ async def garmin_login_mfa(request: Request):
     except queue.Empty:
         raise HTTPException(status_code=504, detail="Garmin login timed out after MFA")
 
-    if result["ok"]:
-        return {"success": True}
-    raise HTTPException(status_code=result["status"], detail=result["detail"])
+    if not result["ok"]:
+        raise HTTPException(status_code=result["status"], detail=result["detail"])
+
+    client = session["client_holder"].get("client")
+    if not client:
+        raise HTTPException(status_code=500, detail="Login succeeded but no client present")
+    oauth1, oauth2 = tokens_from_client(client)
+    return {"success": True, "oauth1_token": oauth1, "oauth2_token": oauth2}
 
 
 # ─── /garmin-activities (token-based) ─────────────────────────────────────────
 @app.post("/garmin-activities")
 async def post_activities(request: Request):
     """
-    Body: { email, days?, password? }
-    Uses stored tokens. If missing/expired and no password → 401.
+    Body: { email, oauth1_token, oauth2_token, days? }
     """
     body = await request.json()
     email = body.get("email")
-    password = body.get("password")
+    oauth1_token = body.get("oauth1_token")
+    oauth2_token = body.get("oauth2_token")
     days = body.get("days", 30)
 
-    if not email:
-        raise HTTPException(status_code=400, detail="email required")
+    if not email or not oauth1_token or not oauth2_token:
+        raise HTTPException(status_code=400, detail="email, oauth1_token, oauth2_token required")
 
     try:
         try:
-            client = login_with_tokens(email)
-        except GarminConnectAuthenticationError:
-            if not password:
-                raise HTTPException(status_code=401, detail="No valid Garmin session — please re-login")
-            token_path = get_user_token_path(email)
-            client = Garmin(email=email, password=password)
-            client.login(token_path)
+            client = client_from_tokens(oauth1_token, oauth2_token)
+        except Exception as e:
+            raise HTTPException(status_code=401, detail=f"Invalid Garmin tokens: {e}")
 
         end_date = datetime.now()
         start_date = end_date - timedelta(days=days)
@@ -255,7 +262,7 @@ async def post_activities(request: Request):
     except GarminConnectTooManyRequestsError:
         raise HTTPException(status_code=429, detail="Garmin Rate Limit")
     except (GarminConnectAuthenticationError, GarminConnectConnectionError) as e:
-        raise HTTPException(status_code=401, detail=f"Garmin login failed: {e}")
+        raise HTTPException(status_code=401, detail=f"Garmin session expired: {e}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -265,21 +272,18 @@ async def post_activities(request: Request):
 async def post_activity_details(request: Request):
     body = await request.json()
     email = body.get("email")
-    password = body.get("password")
+    oauth1_token = body.get("oauth1_token")
+    oauth2_token = body.get("oauth2_token")
     activity_ids = body.get("activity_ids", "")
 
-    if not email:
-        raise HTTPException(status_code=400, detail="email required")
+    if not email or not oauth1_token or not oauth2_token:
+        raise HTTPException(status_code=400, detail="email, oauth1_token, oauth2_token required")
 
     try:
         try:
-            client = login_with_tokens(email)
-        except GarminConnectAuthenticationError:
-            if not password:
-                raise HTTPException(status_code=401, detail="No valid Garmin session — please re-login")
-            token_path = get_user_token_path(email)
-            client = Garmin(email=email, password=password)
-            client.login(token_path)
+            client = client_from_tokens(oauth1_token, oauth2_token)
+        except Exception as e:
+            raise HTTPException(status_code=401, detail=f"Invalid Garmin tokens: {e}")
 
         ids = [aid.strip() for aid in activity_ids.split(",") if aid.strip()]
         result = {}
