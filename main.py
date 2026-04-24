@@ -29,22 +29,44 @@ def log(msg: str):
     sys.stdout.flush()
 
 
-# ─── Token / session serialization ────────────────────────────────────────────
+# ─── Token / session serialization (version-tolerant) ─────────────────────────
 def dump_session(client: Garmin) -> str:
-    """Serialize the entire garth session (works mid-MFA too)."""
-    return client.garth.dumps()
+    """Serialize the Garmin session to a string blob across library versions."""
+    for attr_path in (("garth",), ("client",), ("_garth",)):
+        obj = client
+        ok = True
+        for attr in attr_path:
+            if hasattr(obj, attr):
+                obj = getattr(obj, attr)
+            else:
+                ok = False
+                break
+        if ok and hasattr(obj, "dumps"):
+            return obj.dumps()
+    if hasattr(client, "dumps"):
+        return client.dumps()
+    raise RuntimeError("Cannot find a dumps() method on Garmin client (unsupported version)")
 
 
 def restore_client(token_blob: str) -> Garmin:
+    """Rehydrate a Garmin client from a previously dumped session blob."""
     garmin = Garmin()
+    # Try direct loads on the client
+    if hasattr(garmin, "loads"):
+        try:
+            garmin.loads(token_blob)
+            return garmin
+        except Exception:
+            pass
+    # Try loads on inner garth
+    if hasattr(garmin, "garth") and hasattr(garmin.garth, "loads"):
+        try:
+            garmin.garth.loads(token_blob)
+            return garmin
+        except Exception:
+            pass
+    # Fall back: pass blob to login()
     garmin.login(token_blob)
-    return garmin
-
-
-def restore_client_for_mfa(token_blob: str, email: str, password: str) -> Garmin:
-    """Rehydrate a Garmin client mid-MFA so resume_login can finish it."""
-    garmin = Garmin(email=email, password=password, return_on_mfa=True)
-    garmin.garth.loads(token_blob)
     return garmin
 
 
@@ -97,7 +119,6 @@ async def garmin_login(request: Request):
         # Detect "MFA required". The library may signal it as:
         #   - tuple ("needs_mfa", client_state)
         #   - bare string "needs_mfa"
-        #   - or any non-True value while session is partially established.
         needs_mfa = False
         if isinstance(result, tuple) and len(result) >= 1 and result[0] == "needs_mfa":
             needs_mfa = True
@@ -105,23 +126,24 @@ async def garmin_login(request: Request):
             needs_mfa = True
 
         if needs_mfa:
-            log("[LOGIN] MFA required — dumping partial garth session as mfa_state")
-            try:
-                state_blob = dump_session(garmin)
-                log(f"[LOGIN] dumped session, length={len(state_blob)}")
-            except Exception as e:
-                log(f"[LOGIN] FAILED to dump partial session: {e}")
-                traceback.print_exc()
-                raise HTTPException(status_code=500, detail=f"Cannot serialize MFA state: {e}")
-
+            # This library version doesn't expose a serializable MFA state.
+            # Tell the client to resubmit email + password + code together;
+            # step 2 will redo the login with a prompt_mfa callback.
+            log("[LOGIN] MFA required — client must resubmit with code")
             return {
                 "success": True,
                 "needs_mfa": True,
-                "mfa_state": state_blob,
+                "mfa_state": "stateless",  # marker only, not used server-side
             }
 
         # No MFA — login completed
-        blob = dump_session(garmin)
+        try:
+            blob = dump_session(garmin)
+        except Exception as e:
+            log(f"[LOGIN] dump failed (no-MFA path): {e}")
+            traceback.print_exc()
+            raise HTTPException(status_code=500, detail=f"Cannot dump session: {e}")
+
         log("[LOGIN] no MFA, login complete")
         return {
             "success": True,
@@ -153,34 +175,34 @@ async def garmin_login_mfa(request: Request):
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid JSON body: {e}")
 
-    mfa_state_blob = body.get("mfa_state")
     mfa_code = body.get("mfa_code")
     email = body.get("email")
     password = body.get("password")
 
-    log(f"[MFA] received: has_state={bool(mfa_state_blob)}, has_code={bool(mfa_code)}, has_email={bool(email)}, has_password={bool(password)}")
+    log(f"[MFA] received: has_code={bool(mfa_code)}, has_email={bool(email)}, has_password={bool(password)}")
 
-    if not mfa_state_blob or not mfa_code or not email or not password:
-        raise HTTPException(status_code=400, detail="mfa_state, mfa_code, email and password required")
+    if not mfa_code or not email or not password:
+        raise HTTPException(status_code=400, detail="mfa_code, email and password required")
+
+    code = str(mfa_code).strip()
 
     try:
-        log("[MFA] rehydrating Garmin client from mfa_state")
-        garmin = restore_client_for_mfa(mfa_state_blob, email, password)
+        # Single-shot login with a prompt_mfa callback.
+        # The library will trigger MFA, call our callback to get the code,
+        # then complete the login in one call — no state to serialize.
+        log("[MFA] starting fresh login with prompt_mfa callback")
+        garmin = Garmin(email=email, password=password, prompt_mfa=lambda: code)
+        garmin.login()
+        log("[MFA] login() with prompt_mfa completed")
 
-        log("[MFA] calling resume_login...")
         try:
-            # Newer API: resume_login(code) — uses internal client_state
-            garmin.resume_login(str(mfa_code).strip())
-            log("[MFA] resume_login(code) succeeded")
-        except TypeError:
-            # Older API: resume_login(client_state, code)
-            log("[MFA] resume_login(code) signature failed — falling back to (None, code)")
-            garmin.resume_login(None, str(mfa_code).strip())
+            blob = dump_session(garmin)
+        except Exception as e:
+            log(f"[MFA] dump failed: {e}")
+            traceback.print_exc()
+            raise HTTPException(status_code=500, detail=f"Cannot dump session: {e}")
 
-        log("[MFA] dumping final session tokens")
-        blob = dump_session(garmin)
         log(f"[MFA] success — token blob length={len(blob)}")
-
         return {
             "success": True,
             "oauth1_token": blob,
