@@ -51,21 +51,18 @@ def dump_session(client: Garmin) -> str:
 def restore_client(token_blob: str) -> Garmin:
     """Rehydrate a Garmin client from a previously dumped session blob."""
     garmin = Garmin()
-    # Try direct loads on the client
     if hasattr(garmin, "loads"):
         try:
             garmin.loads(token_blob)
             return garmin
         except Exception:
             pass
-    # Try loads on inner garth
     if hasattr(garmin, "garth") and hasattr(garmin.garth, "loads"):
         try:
             garmin.garth.loads(token_blob)
             return garmin
         except Exception:
             pass
-    # Fall back: pass blob to login()
     garmin.login(token_blob)
     return garmin
 
@@ -116,9 +113,6 @@ async def garmin_login(request: Request):
         result = garmin.login()
         log(f"[LOGIN] login() returned type={type(result).__name__}")
 
-        # Detect "MFA required". The library may signal it as:
-        #   - tuple ("needs_mfa", client_state)
-        #   - bare string "needs_mfa"
         needs_mfa = False
         if isinstance(result, tuple) and len(result) >= 1 and result[0] == "needs_mfa":
             needs_mfa = True
@@ -126,17 +120,13 @@ async def garmin_login(request: Request):
             needs_mfa = True
 
         if needs_mfa:
-            # This library version doesn't expose a serializable MFA state.
-            # Tell the client to resubmit email + password + code together;
-            # step 2 will redo the login with a prompt_mfa callback.
             log("[LOGIN] MFA required — client must resubmit with code")
             return {
                 "success": True,
                 "needs_mfa": True,
-                "mfa_state": "stateless",  # marker only, not used server-side
+                "mfa_state": "stateless",
             }
 
-        # No MFA — login completed
         try:
             blob = dump_session(garmin)
         except Exception as e:
@@ -187,9 +177,6 @@ async def garmin_login_mfa(request: Request):
     code = str(mfa_code).strip()
 
     try:
-        # Single-shot login with a prompt_mfa callback.
-        # The library will trigger MFA, call our callback to get the code,
-        # then complete the login in one call — no state to serialize.
         log("[MFA] starting fresh login with prompt_mfa callback")
         garmin = Garmin(email=email, password=password, prompt_mfa=lambda: code)
         garmin.login()
@@ -225,13 +212,40 @@ async def garmin_login_mfa(request: Request):
 # ─── /garmin-activities ───────────────────────────────────────────────────────
 @app.post("/garmin-activities")
 async def post_activities(request: Request):
+    """Fetch Garmin activities for a date range.
+
+    Request body:
+      - email          (required)
+      - oauth1_token   (required)
+      - start_date     (optional, "YYYY-MM-DD")  ──┐
+      - end_date       (optional, "YYYY-MM-DD")  ──┴─ preferred
+      - days           (optional, int)            ──── fallback if no dates
+    """
     body = await request.json()
     email = body.get("email")
     oauth1_token = body.get("oauth1_token")
-    days = body.get("days", 30)
+    start_date_str = body.get("start_date")
+    end_date_str = body.get("end_date")
+    days = body.get("days")
 
     if not email or not oauth1_token:
         raise HTTPException(status_code=400, detail="email and oauth1_token required")
+
+    # Resolve date window
+    try:
+        if start_date_str and end_date_str:
+            start_date = datetime.strptime(start_date_str, "%Y-%m-%d")
+            end_date = datetime.strptime(end_date_str, "%Y-%m-%d")
+        else:
+            end_date = datetime.now()
+            start_date = end_date - timedelta(days=int(days) if days else 30)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"Invalid date format (expected YYYY-MM-DD): {e}")
+
+    if start_date > end_date:
+        raise HTTPException(status_code=400, detail="start_date must be <= end_date")
+
+    log(f"[ACTIVITIES] window {start_date.date()} → {end_date.date()} for {email}")
 
     try:
         try:
@@ -239,13 +253,12 @@ async def post_activities(request: Request):
         except Exception as e:
             raise HTTPException(status_code=401, detail=f"Invalid Garmin tokens: {type(e).__name__}: {e}")
 
-        end_date = datetime.now()
-        start_date = end_date - timedelta(days=days)
-
         activities = client.get_activities_by_date(
             start_date.strftime("%Y-%m-%d"),
             end_date.strftime("%Y-%m-%d"),
         )
+
+        log(f"[ACTIVITIES] fetched {len(activities)} activities")
 
         results = []
         for a in activities:
