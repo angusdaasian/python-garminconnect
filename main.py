@@ -12,6 +12,7 @@ import sys
 import shutil
 import tempfile
 import traceback
+import json
 from pathlib import Path
 from datetime import datetime, timedelta
 import polyline
@@ -33,10 +34,13 @@ def log(msg: str):
 
 
 # ─── Token store helpers ──────────────────────────────────────────────────────
-# python-garminconnect 3.0+ persists tokens as files in a directory.
-# We marshal Supabase's stored blobs into a temp dir, call Garmin().login(dir),
-# then read back whatever the library wrote — that's how OAuth2 auto-refresh
-# becomes visible to us.
+# python-garminconnect wraps `garth`. The source of truth for current tokens
+# is `garmin.garth.oauth1_token` and `garmin.garth.oauth2_token` — Python
+# objects with a `.dumps()` method that returns the JSON blob we persist.
+#
+# We do NOT rely on garth dumping files to disk, because behavior varies by
+# version (sometimes it writes to the dir we pass, sometimes to ~/.garminconnect,
+# sometimes not at all if the OAuth2 token is still valid).
 
 OAUTH1_FILENAME = "oauth1_token.json"
 OAUTH2_FILENAME = "oauth2_token.json"
@@ -47,28 +51,38 @@ def _write_tokenstore(oauth1_blob: str, oauth2_blob: str | None) -> str:
     Path(tdir, OAUTH1_FILENAME).write_text(oauth1_blob)
     # Only write oauth2 file if we actually have a real oauth2 blob.
     # Seeding it with the oauth1 blob corrupts login (garth tries to parse
-    # an OAuth1 ticket as an OAuth2 token and fails with auth error).
+    # an OAuth1 ticket as an OAuth2 token and fails).
     if oauth2_blob:
         Path(tdir, OAUTH2_FILENAME).write_text(oauth2_blob)
     return tdir
 
 
-def _read_tokenstore(
-    tdir: str,
-    fallback_o1: str,
-    fallback_o2: str | None,
-) -> tuple[str, str | None]:
-    """Read tokens that the library wrote back to disk.
+def _extract_tokens_from_client(garmin: Garmin) -> tuple[str, str]:
+    """Pull the current OAuth1 + OAuth2 token blobs straight from the
+    `garth` client embedded in the Garmin object. This is version-agnostic:
+    no matter what garminconnect 3.x does with on-disk files, the in-memory
+    garth client holds the live tokens after a successful login."""
+    garth = getattr(garmin, "garth", None)
+    if garth is None:
+        raise RuntimeError("garmin.garth is missing — unsupported library version")
 
-    If a file is missing (some garminconnect versions don't always rewrite
-    both), fall back to the original blob the caller passed in. This avoids
-    the FileNotFoundError seen in production logs.
-    """
-    p1 = Path(tdir, OAUTH1_FILENAME)
-    p2 = Path(tdir, OAUTH2_FILENAME)
-    o1 = p1.read_text() if p1.exists() else fallback_o1
-    o2 = p2.read_text() if p2.exists() else fallback_o2
-    return o1, o2
+    o1_obj = getattr(garth, "oauth1_token", None)
+    o2_obj = getattr(garth, "oauth2_token", None)
+    if o1_obj is None or o2_obj is None:
+        raise RuntimeError("garth has no oauth1_token / oauth2_token after login")
+
+    # Both garth token objects expose .dumps() → JSON string.
+    # Fall back to json.dumps(asdict) if .dumps is missing on some versions.
+    def to_blob(tok) -> str:
+        if hasattr(tok, "dumps") and callable(tok.dumps):
+            return tok.dumps()
+        # Last-ditch: serialize __dict__
+        try:
+            return json.dumps(tok.__dict__, default=str)
+        except Exception as e:
+            raise RuntimeError(f"cannot serialize garth token: {e}")
+
+    return to_blob(o1_obj), to_blob(o2_obj)
 
 
 def login_with_tokens(oauth1_blob: str, oauth2_blob: str | None = None):
@@ -82,7 +96,7 @@ def login_with_tokens(oauth1_blob: str, oauth2_blob: str | None = None):
     try:
         garmin = Garmin()
         garmin.login(tdir)  # auto-refreshes OAuth2 in place if expired
-        new_o1, new_o2 = _read_tokenstore(tdir, oauth1_blob, oauth2_blob)
+        new_o1, new_o2 = _extract_tokens_from_client(garmin)
         return garmin, new_o1, new_o2
     finally:
         shutil.rmtree(tdir, ignore_errors=True)
@@ -112,11 +126,9 @@ def fresh_login(email: str, password: str, mfa_code: str | None = None):
             )
             if needs_mfa:
                 raise _MFARequired()
-        # Fresh login MUST produce both files. If not, surface a clear error
-        # instead of crashing inside _read_tokenstore.
-        oauth1, oauth2 = _read_tokenstore(tdir, "", "")
+        oauth1, oauth2 = _extract_tokens_from_client(garmin)
         if not oauth1 or not oauth2:
-            raise RuntimeError("login succeeded but tokenstore files are missing")
+            raise RuntimeError("login succeeded but garth returned empty tokens")
         return garmin, oauth1, oauth2
     finally:
         shutil.rmtree(tdir, ignore_errors=True)
