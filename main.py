@@ -6,15 +6,10 @@ from garminconnect import (
     GarminConnectConnectionError,
     GarminConnectTooManyRequestsError,
 )
-import garth
 import uvicorn
 import os
 import sys
-import shutil
-import tempfile
 import traceback
-import json
-from pathlib import Path
 from datetime import datetime, timedelta
 import polyline
 import xml.etree.ElementTree as ET
@@ -34,75 +29,42 @@ def log(msg: str):
     sys.stdout.flush()
 
 
-OAUTH1_FILENAME = "oauth1_token.json"
-OAUTH2_FILENAME = "oauth2_token.json"
+# ─── Token / session serialization (version-tolerant) ─────────────────────────
+def dump_session(client: Garmin) -> str:
+    """Serialize the Garmin session to a string blob across library versions."""
+    for attr_path in (("garth",), ("client",), ("_garth",)):
+        obj = client
+        ok = True
+        for attr in attr_path:
+            if hasattr(obj, attr):
+                obj = getattr(obj, attr)
+            else:
+                ok = False
+                break
+        if ok and hasattr(obj, "dumps"):
+            return obj.dumps()
+    if hasattr(client, "dumps"):
+        return client.dumps()
+    raise RuntimeError("Cannot find a dumps() method on Garmin client (unsupported version)")
 
 
-def _write_tokenstore(oauth1_blob: str, oauth2_blob: str | None) -> str:
-    tdir = tempfile.mkdtemp(prefix="gctok_")
-    Path(tdir, OAUTH1_FILENAME).write_text(oauth1_blob)
-    if oauth2_blob:
-        Path(tdir, OAUTH2_FILENAME).write_text(oauth2_blob)
-    return tdir
-
-
-def _extract_tokens() -> tuple[str, str]:
-    """Pull live tokens from the module-level garth client.
-    garminconnect uses garth under the hood — `garth.client` holds
-    the current OAuth1 + OAuth2 tokens after any login or refresh."""
-    o1 = getattr(garth.client, "oauth1_token", None)
-    o2 = getattr(garth.client, "oauth2_token", None)
-    if o1 is None or o2 is None:
-        raise RuntimeError("garth.client has no tokens after login")
-
-    def to_blob(tok) -> str:
-        if hasattr(tok, "dumps") and callable(tok.dumps):
-            return tok.dumps()
+def restore_client(token_blob: str) -> Garmin:
+    """Rehydrate a Garmin client from a previously dumped session blob."""
+    garmin = Garmin()
+    if hasattr(garmin, "loads"):
         try:
-            return json.dumps(tok.__dict__, default=str)
-        except Exception as e:
-            raise RuntimeError(f"cannot serialize garth token: {e}")
-
-    return to_blob(o1), to_blob(o2)
-
-
-def login_with_tokens(oauth1_blob: str, oauth2_blob: str | None = None):
-    """Restore a Garmin session from stored tokens."""
-    tdir = _write_tokenstore(oauth1_blob, oauth2_blob)
-    try:
-        garmin = Garmin()
-        garmin.login(tdir)  # loads tokens via garth.resume(tdir) internally
-        new_o1, new_o2 = _extract_tokens()
-        return garmin, new_o1, new_o2
-    finally:
-        shutil.rmtree(tdir, ignore_errors=True)
-
-
-class _MFARequired(Exception):
-    pass
-
-
-def fresh_login(email: str, password: str, mfa_code: str | None = None):
-    """Fresh credentials login. Returns (client, oauth1, oauth2)."""
-    tdir = tempfile.mkdtemp(prefix="gctok_")
-    try:
-        if mfa_code is not None:
-            code = str(mfa_code).strip()
-            garmin = Garmin(email=email, password=password, prompt_mfa=lambda: code)
-            garmin.login(tdir)
-        else:
-            garmin = Garmin(email=email, password=password, return_on_mfa=True)
-            result = garmin.login(tdir)
-            needs_mfa = (
-                (isinstance(result, tuple) and len(result) >= 1 and result[0] == "needs_mfa")
-                or (isinstance(result, str) and result == "needs_mfa")
-            )
-            if needs_mfa:
-                raise _MFARequired()
-        oauth1, oauth2 = _extract_tokens()
-        return garmin, oauth1, oauth2
-    finally:
-        shutil.rmtree(tdir, ignore_errors=True)
+            garmin.loads(token_blob)
+            return garmin
+        except Exception:
+            pass
+    if hasattr(garmin, "garth") and hasattr(garmin.garth, "loads"):
+        try:
+            garmin.garth.loads(token_blob)
+            return garmin
+        except Exception:
+            pass
+    garmin.login(token_blob)
+    return garmin
 
 
 def parse_gpx_to_polyline(gpx_bytes: bytes) -> str | None:
@@ -132,13 +94,10 @@ async def root():
         version = getattr(gc, "__version__", "unknown")
     except Exception:
         version = "unknown"
-    try:
-        garth_version = getattr(garth, "__version__", "unknown")
-    except Exception:
-        garth_version = "unknown"
-    return {"status": "ok", "garminconnect_version": version, "garth_version": garth_version}
+    return {"status": "ok", "garminconnect_version": version}
 
 
+# ─── /garmin-login (step 1) ───────────────────────────────────────────────────
 @app.post("/garmin-login")
 async def garmin_login(request: Request):
     body = await request.json()
@@ -150,18 +109,37 @@ async def garmin_login(request: Request):
     log(f"[LOGIN] start for {email}")
 
     try:
-        try:
-            _, oauth1, oauth2 = fresh_login(email, password, mfa_code=None)
-        except _MFARequired:
+        garmin = Garmin(email=email, password=password, return_on_mfa=True)
+        result = garmin.login()
+        log(f"[LOGIN] login() returned type={type(result).__name__}")
+
+        needs_mfa = False
+        if isinstance(result, tuple) and len(result) >= 1 and result[0] == "needs_mfa":
+            needs_mfa = True
+        elif isinstance(result, str) and result == "needs_mfa":
+            needs_mfa = True
+
+        if needs_mfa:
             log("[LOGIN] MFA required — client must resubmit with code")
-            return {"success": True, "needs_mfa": True, "mfa_state": "stateless"}
+            return {
+                "success": True,
+                "needs_mfa": True,
+                "mfa_state": "stateless",
+            }
+
+        try:
+            blob = dump_session(garmin)
+        except Exception as e:
+            log(f"[LOGIN] dump failed (no-MFA path): {e}")
+            traceback.print_exc()
+            raise HTTPException(status_code=500, detail=f"Cannot dump session: {e}")
 
         log("[LOGIN] no MFA, login complete")
         return {
             "success": True,
             "needs_mfa": False,
-            "oauth1_token": oauth1,
-            "oauth2_token": oauth2,
+            "oauth1_token": blob,
+            "oauth2_token": blob,
         }
 
     except GarminConnectAuthenticationError as e:
@@ -178,6 +156,7 @@ async def garmin_login(request: Request):
         raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
 
 
+# ─── /garmin-login-mfa (step 2) ───────────────────────────────────────────────
 @app.post("/garmin-login-mfa")
 async def garmin_login_mfa(request: Request):
     log("[MFA] ===== /garmin-login-mfa called =====")
@@ -195,10 +174,27 @@ async def garmin_login_mfa(request: Request):
     if not mfa_code or not email or not password:
         raise HTTPException(status_code=400, detail="mfa_code, email and password required")
 
+    code = str(mfa_code).strip()
+
     try:
-        _, oauth1, oauth2 = fresh_login(email, password, mfa_code=mfa_code)
-        log(f"[MFA] success — oauth1 len={len(oauth1)} oauth2 len={len(oauth2)}")
-        return {"success": True, "oauth1_token": oauth1, "oauth2_token": oauth2}
+        log("[MFA] starting fresh login with prompt_mfa callback")
+        garmin = Garmin(email=email, password=password, prompt_mfa=lambda: code)
+        garmin.login()
+        log("[MFA] login() with prompt_mfa completed")
+
+        try:
+            blob = dump_session(garmin)
+        except Exception as e:
+            log(f"[MFA] dump failed: {e}")
+            traceback.print_exc()
+            raise HTTPException(status_code=500, detail=f"Cannot dump session: {e}")
+
+        log(f"[MFA] success — token blob length={len(blob)}")
+        return {
+            "success": True,
+            "oauth1_token": blob,
+            "oauth2_token": blob,
+        }
 
     except GarminConnectAuthenticationError as e:
         log(f"[MFA] auth failed: {e}")
@@ -209,15 +205,25 @@ async def garmin_login_mfa(request: Request):
     except Exception as e:
         log(f"[MFA] UNEXPECTED ERROR: {type(e).__name__}: {e}")
         traceback.print_exc()
+        sys.stdout.flush()
         raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
 
 
+# ─── /garmin-activities ───────────────────────────────────────────────────────
 @app.post("/garmin-activities")
 async def post_activities(request: Request):
+    """Fetch Garmin activities for a date range.
+
+    Request body:
+      - email          (required)
+      - oauth1_token   (required)
+      - start_date     (optional, "YYYY-MM-DD")  ──┐
+      - end_date       (optional, "YYYY-MM-DD")  ──┴─ preferred
+      - days           (optional, int)            ──── fallback if no dates
+    """
     body = await request.json()
     email = body.get("email")
     oauth1_token = body.get("oauth1_token")
-    oauth2_token = body.get("oauth2_token")
     start_date_str = body.get("start_date")
     end_date_str = body.get("end_date")
     days = body.get("days")
@@ -233,7 +239,7 @@ async def post_activities(request: Request):
             end_date = datetime.now()
             start_date = end_date - timedelta(days=int(days) if days else 30)
     except ValueError as e:
-        raise HTTPException(status_code=400, detail=f"Invalid date format: {e}")
+        raise HTTPException(status_code=400, detail=f"Invalid date format (expected YYYY-MM-DD): {e}")
 
     if start_date > end_date:
         raise HTTPException(status_code=400, detail="start_date must be <= end_date")
@@ -242,9 +248,7 @@ async def post_activities(request: Request):
 
     try:
         try:
-            client, new_o1, new_o2 = login_with_tokens(oauth1_token, oauth2_token)
-        except (GarminConnectAuthenticationError, GarminConnectConnectionError) as e:
-            raise HTTPException(status_code=401, detail=f"Garmin session expired: {e}")
+            client = restore_client(oauth1_token)
         except Exception as e:
             raise HTTPException(status_code=401, detail=f"Invalid Garmin tokens: {type(e).__name__}: {e}")
 
@@ -284,11 +288,7 @@ async def post_activities(request: Request):
                 "has_gps": a.get("hasPolyline", False),
             })
 
-        return {
-            "activities": results,
-            "oauth1_token": new_o1,
-            "oauth2_token": new_o2,
-        }
+        return results
 
     except HTTPException:
         raise
@@ -300,12 +300,12 @@ async def post_activities(request: Request):
         raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
 
 
+# ─── /garmin-activity-details ─────────────────────────────────────────────────
 @app.post("/garmin-activity-details")
 async def post_activity_details(request: Request):
     body = await request.json()
     email = body.get("email")
     oauth1_token = body.get("oauth1_token")
-    oauth2_token = body.get("oauth2_token")
     activity_ids = body.get("activity_ids", "")
 
     if not email or not oauth1_token:
@@ -313,9 +313,7 @@ async def post_activity_details(request: Request):
 
     try:
         try:
-            client, new_o1, new_o2 = login_with_tokens(oauth1_token, oauth2_token)
-        except (GarminConnectAuthenticationError, GarminConnectConnectionError) as e:
-            raise HTTPException(status_code=401, detail=f"Garmin session expired: {e}")
+            client = restore_client(oauth1_token)
         except Exception as e:
             raise HTTPException(status_code=401, detail=f"Invalid Garmin tokens: {type(e).__name__}: {e}")
 
@@ -367,11 +365,7 @@ async def post_activity_details(request: Request):
                 log(f"Skipping details for {activity_id}: {e}")
                 result[str(activity_id)] = None
 
-        return {
-            "details": result,
-            "oauth1_token": new_o1,
-            "oauth2_token": new_o2,
-        }
+        return result
 
     except HTTPException:
         raise
@@ -381,12 +375,19 @@ async def post_activity_details(request: Request):
         raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
 
 
+# ─── /garmin-health-stats ─────────────────────────────────────────────────────
 @app.post("/garmin-health-stats")
 async def post_health_stats(request: Request):
+    """Return vo2max, resting HR, sleep duration, and sleep score for a date.
+
+    Request body:
+      - email          (required)
+      - oauth1_token   (required)
+      - date           (optional, "YYYY-MM-DD" — defaults to today)
+    """
     body = await request.json()
     email = body.get("email")
     oauth1_token = body.get("oauth1_token")
-    oauth2_token = body.get("oauth2_token")
     date_str = body.get("date") or datetime.now().strftime("%Y-%m-%d")
 
     if not email or not oauth1_token:
@@ -401,12 +402,11 @@ async def post_health_stats(request: Request):
 
     try:
         try:
-            client, new_o1, new_o2 = login_with_tokens(oauth1_token, oauth2_token)
-        except (GarminConnectAuthenticationError, GarminConnectConnectionError) as e:
-            raise HTTPException(status_code=401, detail=f"Garmin session expired: {e}")
+            client = restore_client(oauth1_token)
         except Exception as e:
             raise HTTPException(status_code=401, detail=f"Invalid Garmin tokens: {type(e).__name__}: {e}")
 
+        # Resting HR — try get_heart_rates first, fall back to user summary.
         resting_hr = None
         try:
             hr = client.get_heart_rates(date_str) or {}
@@ -420,6 +420,7 @@ async def post_health_stats(request: Request):
             except Exception as e:
                 log(f"[HEALTH] user_summary failed: {e}")
 
+        # Sleep duration + sleep score
         sleep_seconds = None
         sleep_score = None
         try:
@@ -432,6 +433,7 @@ async def post_health_stats(request: Request):
         except Exception as e:
             log(f"[HEALTH] sleep_data failed: {e}")
 
+        # VO2max — get_max_metrics returns a list; running entry sits under "generic".
         vo2max = None
         try:
             mm = client.get_max_metrics(date_str)
@@ -447,8 +449,6 @@ async def post_health_stats(request: Request):
             "resting_hr": resting_hr,
             "sleep_seconds": sleep_seconds,
             "sleep_score": sleep_score,
-            "oauth1_token": new_o1,
-            "oauth2_token": new_o2,
         }
 
     except HTTPException:
