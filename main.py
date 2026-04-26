@@ -36,7 +36,7 @@ def log(msg: str):
 # python-garminconnect 3.0+ persists tokens as files in a directory.
 # We marshal Supabase's stored blobs into a temp dir, call Garmin().login(dir),
 # then read back whatever the library wrote — that's how OAuth2 auto-refresh
-# becomes visible to us. No `garth` references anywhere.
+# becomes visible to us.
 
 OAUTH1_FILENAME = "oauth1_token.json"
 OAUTH2_FILENAME = "oauth2_token.json"
@@ -45,16 +45,30 @@ OAUTH2_FILENAME = "oauth2_token.json"
 def _write_tokenstore(oauth1_blob: str, oauth2_blob: str | None) -> str:
     tdir = tempfile.mkdtemp(prefix="gctok_")
     Path(tdir, OAUTH1_FILENAME).write_text(oauth1_blob)
-    # Legacy rows may have stored only one blob — seed both files so .login()
-    # can parse the directory.
-    Path(tdir, OAUTH2_FILENAME).write_text(oauth2_blob or oauth1_blob)
+    # Only write oauth2 file if we actually have a real oauth2 blob.
+    # Seeding it with the oauth1 blob corrupts login (garth tries to parse
+    # an OAuth1 ticket as an OAuth2 token and fails with auth error).
+    if oauth2_blob:
+        Path(tdir, OAUTH2_FILENAME).write_text(oauth2_blob)
     return tdir
 
 
-def _read_tokenstore(tdir: str) -> tuple[str, str]:
-    oauth1 = Path(tdir, OAUTH1_FILENAME).read_text()
-    oauth2 = Path(tdir, OAUTH2_FILENAME).read_text()
-    return oauth1, oauth2
+def _read_tokenstore(
+    tdir: str,
+    fallback_o1: str,
+    fallback_o2: str | None,
+) -> tuple[str, str | None]:
+    """Read tokens that the library wrote back to disk.
+
+    If a file is missing (some garminconnect versions don't always rewrite
+    both), fall back to the original blob the caller passed in. This avoids
+    the FileNotFoundError seen in production logs.
+    """
+    p1 = Path(tdir, OAUTH1_FILENAME)
+    p2 = Path(tdir, OAUTH2_FILENAME)
+    o1 = p1.read_text() if p1.exists() else fallback_o1
+    o2 = p2.read_text() if p2.exists() else fallback_o2
+    return o1, o2
 
 
 def login_with_tokens(oauth1_blob: str, oauth2_blob: str | None = None):
@@ -68,7 +82,7 @@ def login_with_tokens(oauth1_blob: str, oauth2_blob: str | None = None):
     try:
         garmin = Garmin()
         garmin.login(tdir)  # auto-refreshes OAuth2 in place if expired
-        new_o1, new_o2 = _read_tokenstore(tdir)
+        new_o1, new_o2 = _read_tokenstore(tdir, oauth1_blob, oauth2_blob)
         return garmin, new_o1, new_o2
     finally:
         shutil.rmtree(tdir, ignore_errors=True)
@@ -98,7 +112,11 @@ def fresh_login(email: str, password: str, mfa_code: str | None = None):
             )
             if needs_mfa:
                 raise _MFARequired()
-        oauth1, oauth2 = _read_tokenstore(tdir)
+        # Fresh login MUST produce both files. If not, surface a clear error
+        # instead of crashing inside _read_tokenstore.
+        oauth1, oauth2 = _read_tokenstore(tdir, "", "")
+        if not oauth1 or not oauth2:
+            raise RuntimeError("login succeeded but tokenstore files are missing")
         return garmin, oauth1, oauth2
     finally:
         shutil.rmtree(tdir, ignore_errors=True)
@@ -380,7 +398,7 @@ async def post_activity_details(request: Request):
         raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
 
 
-# ─── /garmin-health-stats (NEW) ───────────────────────────────────────────────
+# ─── /garmin-health-stats ─────────────────────────────────────────────────────
 @app.post("/garmin-health-stats")
 async def post_health_stats(request: Request):
     """Return vo2max, resting HR, sleep duration, and sleep score for a date.
