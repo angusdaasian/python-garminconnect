@@ -324,16 +324,40 @@ async def post_activity_details(request: Request):
             try:
                 item = {"laps": [], "weather": None, "map_polyline": None}
 
-                splits_data = client.get_activity_splits(activity_id)
-                for lap in splits_data.get("lapDTOs", []):
+                splits_data = client.get_activity_splits(activity_id) or {}
+                lap_dtos = splits_data.get("lapDTOs") or []
+
+                # Fallback: some activities only expose laps on the full activity payload.
+                if not lap_dtos:
+                    try:
+                        full = client.get_activity(activity_id) or {}
+                        lap_dtos = full.get("lapDTOs") or full.get("splits") or []
+                    except Exception as lap_err:
+                        log(f"lap fallback failed for {activity_id}: {lap_err}")
+                        lap_dtos = []
+
+                for idx, lap in enumerate(lap_dtos):
+                    elapsed = lap.get("elapsedDuration") or lap.get("duration")
+                    moving = lap.get("movingDuration") or lap.get("duration") or elapsed
                     item["laps"].append({
-                        "split_number": lap.get("lapIndex"),
+                        "split_number": (lap.get("lapIndex") or idx + 1),
                         "distance": lap.get("distance"),
-                        "elapsed_time": lap.get("elapsedDuration"),
-                        "avg_hr": lap.get("averageHeartRate"),
+                        "elapsed_time": elapsed,
+                        "moving_time": moving,
+                        "avg_hr": lap.get("averageHR") or lap.get("averageHeartRate"),
+                        "max_hr": lap.get("maxHR") or lap.get("maxHeartRate"),
                         "avg_speed": lap.get("averageSpeed"),
-                        "elevation_gain": int(lap.get("elevationGain", 0)) if lap.get("elevationGain") else 0,
+                        "max_speed": lap.get("maxSpeed"),
+                        "avg_cadence": (
+                            lap.get("averageRunCadence")
+                            or lap.get("averageRunningCadenceInStepsPerMinute")
+                            or lap.get("averageBikeCadence")
+                        ),
+                        "elevation_gain": int(lap.get("elevationGain") or 0),
+                        "elevation_loss": int(lap.get("elevationLoss") or 0),
                     })
+
+                log(f"[DETAILS] {activity_id}: {len(item['laps'])} laps")
 
                 try:
                     weather = client.get_activity_weather(activity_id)
