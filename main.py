@@ -12,6 +12,12 @@ import sys
 import traceback
 from datetime import datetime, timedelta
 import polyline
+
+# Optional helper: available in newer python-garminconnect versions only.
+try:
+    from garminconnect import parse_activity_detail_metrics  # type: ignore
+except Exception:  # pragma: no cover
+    parse_activity_detail_metrics = None
 import xml.etree.ElementTree as ET
 
 app = FastAPI()
@@ -309,6 +315,126 @@ async def post_activities(request: Request):
         raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
 
 
+# ─── per-sample metrics (activity detail) ─────────────────────────────────────
+def extract_samples(client, activity_id) -> dict:
+    """Pull Garmin's per-sample activity detail metrics and reshape them into
+    the compact series the app stores (same shape as Terra):
+      hr_samples        [{"t": secs, "bpm": n}]
+      distance_samples  [{"t": secs, "d": metres}]
+      elevation_samples [{"t": secs, "e": metres}]
+      cadence_samples   [{"t": secs, "rpm": n}]
+    Downsampled to at most MAX_SAMPLES points to keep payloads/rows small.
+    """
+    MAX_SAMPLES = 1200
+    out = {"hr_samples": [], "distance_samples": [], "elevation_samples": [], "cadence_samples": []}
+    details = None
+    try:
+        details = client.get_activity_details(activity_id, maxchart=MAX_SAMPLES, maxpoly=0)
+    except TypeError:
+        try:
+            details = client.get_activity_details(activity_id)
+        except Exception as e:
+            log(f"[SAMPLES] {activity_id}: get_activity_details failed: {e}")
+            return out
+    except Exception as e:
+        log(f"[SAMPLES] {activity_id}: get_activity_details failed: {e}")
+        return out
+
+    if not details:
+        return out
+
+    # Prefer the library helper (resolves positional indices -> metric names).
+    rows = None
+    try:
+        if parse_activity_detail_metrics is None:
+            raise RuntimeError("helper not available in this garminconnect version")
+        parsed = parse_activity_detail_metrics(details)
+        if isinstance(parsed, dict):
+            rows = parsed.get("metrics") or parsed.get("samples") or None
+        elif isinstance(parsed, list):
+            rows = parsed
+    except Exception as e:
+        log(f"[SAMPLES] {activity_id}: parse helper unavailable ({e}), using raw descriptors")
+
+    if rows is None:
+        # Manual fallback: map metricDescriptors by index.
+        descs = details.get("metricDescriptors") or []
+        keys = {}
+        for d in descs:
+            key = (d.get("key") or "").lower()
+            idx = d.get("metricsIndex")
+            if key and idx is not None:
+                keys[key] = idx
+        rows = []
+        for m in (details.get("activityDetailMetrics") or []):
+            vals = m.get("metrics") or []
+            def pick(name):
+                i = keys.get(name)
+                if i is None or i >= len(vals):
+                    return None
+                return vals[i]
+            rows.append({
+                "directTimestamp": pick("directtimestamp"),
+                "sumElapsedDuration": pick("sumelapsedduration") or pick("sumduration"),
+                "directHeartRate": pick("directheartrate"),
+                "sumDistance": pick("sumdistance"),
+                "directElevation": pick("directelevation"),
+                "directRunCadence": pick("directrunCadence".lower()) or pick("directdoublecadence") or pick("directbikecadence"),
+            })
+
+    def num(v):
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            return None
+        return f if f == f else None  # drop NaN
+
+    t0 = None
+    for i, r in enumerate(rows or []):
+        if not isinstance(r, dict):
+            continue
+        # Elapsed seconds: prefer duration field, else timestamp delta, else index.
+        t = num(r.get("sumElapsedDuration") or r.get("sumDuration") or r.get("sumelapsedduration"))
+        if t is None:
+            ts = num(r.get("directTimestamp") or r.get("directtimestamp"))
+            if ts is not None:
+                if ts > 1e11:  # milliseconds
+                    ts = ts / 1000.0
+                if t0 is None:
+                    t0 = ts
+                t = ts - t0
+        if t is None:
+            t = float(i)
+        t = int(round(t))
+
+        hr = num(r.get("directHeartRate") or r.get("directheartrate"))
+        if hr and hr > 30:
+            out["hr_samples"].append({"t": t, "bpm": int(round(hr))})
+
+        dist = num(r.get("sumDistance") or r.get("sumdistance"))
+        if dist is not None and dist >= 0:
+            out["distance_samples"].append({"t": t, "d": round(dist, 1)})
+
+        elev = num(r.get("directElevation") or r.get("directelevation"))
+        if elev is not None:
+            out["elevation_samples"].append({"t": t, "e": round(elev, 1)})
+
+        cad = num(
+            r.get("directRunCadence")
+            or r.get("directDoubleCadence")
+            or r.get("directBikeCadence")
+            or r.get("directruncadence")
+        )
+        if cad and cad > 0:
+            out["cadence_samples"].append({"t": t, "rpm": int(round(cad))})
+
+    log(
+        f"[SAMPLES] {activity_id}: hr={len(out['hr_samples'])} dist={len(out['distance_samples'])} "
+        f"elev={len(out['elevation_samples'])} cad={len(out['cadence_samples'])}"
+    )
+    return out
+
+
 # ─── /garmin-activity-details ─────────────────────────────────────────────────
 @app.post("/garmin-activity-details")
 async def post_activity_details(request: Request):
@@ -331,7 +457,9 @@ async def post_activity_details(request: Request):
 
         for activity_id in ids:
             try:
-                item = {"laps": [], "weather": None, "map_polyline": None}
+                item = {"laps": [], "weather": None, "map_polyline": None,
+                        "hr_samples": [], "distance_samples": [],
+                        "elevation_samples": [], "cadence_samples": []}
 
                 splits_data = client.get_activity_splits(activity_id) or {}
                 lap_dtos = splits_data.get("lapDTOs") or []
@@ -382,6 +510,11 @@ async def post_activity_details(request: Request):
                         }
                 except Exception:
                     pass
+
+                try:
+                    item.update(extract_samples(client, activity_id))
+                except Exception as s_err:
+                    log(f"sample extraction failed for {activity_id}: {s_err}")
 
                 try:
                     gpx_data = client.download_activity(
