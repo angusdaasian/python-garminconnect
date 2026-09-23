@@ -259,6 +259,14 @@ async def post_activities(request: Request):
 
         log(f"[ACTIVITIES] fetched {len(activities)} activities")
 
+        # Map deviceId -> watch model name for brand attribution
+        try:
+            devices = {str(d.get("deviceId")): (d.get("productDisplayName") or d.get("displayName"))
+                       for d in (client.get_devices() or [])}
+        except Exception as e:
+            log(f"[ACTIVITIES] get_devices failed: {e}")
+            devices = {}
+
         results = []
         for a in activities:
             sport = a.get("activityType", {}).get("typeKey", "unknown")
@@ -286,6 +294,7 @@ async def post_activities(request: Request):
                 "vo2max": a.get("vO2MaxValue"),
                 "training_load": a.get("activityTrainingLoad"),
                 "has_gps": a.get("hasPolyline", False),
+                "device_model": devices.get(str(a.get("deviceId"))),
             })
 
         return results
